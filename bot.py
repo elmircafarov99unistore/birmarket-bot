@@ -276,7 +276,12 @@ def write_price(sheet_row: int, new_price: float) -> bool:
 def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -> list:
     prices = []
     try:
-        url = product_url if product_url else f"https://birmarket.az/search?q={barkod}"
+        # URL etibarlımı yoxla
+        if product_url and product_url.startswith("http"):
+            url = product_url
+        else:
+            log.warning(f"  ⚠️  URL tapılmadı [{barkod}], axtarış ilə cəhd edilir.")
+            url = f"https://birmarket.az/search?q={barkod}"
         resp = requests.get(url, timeout=15, headers={
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
         })
