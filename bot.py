@@ -305,8 +305,10 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
         })
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 1. Geniş CSS selektorlar (Birmarket.az üçün)
+        # 1. Birmarket.az əsas selektor
         CSS_SELECTORS = (
+            'span[data-info="item-desc-price-new"]',  # Birmarket.az əsas qiymət
+            'span[data-info="item-desc-price-old"]',
             ".product-offer__price",
             ".seller-price",
             ".offer-price",
@@ -323,7 +325,7 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
         )
         for el in soup.select(", ".join(CSS_SELECTORS)):
             raw = el.get("data-price") or el.get_text(strip=True)
-            text = re.sub(r"[^\d.,]", "", raw).replace(",", ".")
+            text = re.sub(r"[^\d.,\s]", "", raw).replace(",", ".").replace(" ", "")
             try:
                 p = float(text)
                 if 1 < p < 100000:
