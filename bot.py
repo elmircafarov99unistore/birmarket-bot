@@ -35,20 +35,17 @@ from google.oauth2.service_account import Credentials
 # KONFIQURASIYA — buraya öz məlumatlarınızı yazın
 # ─────────────────────────────────────────────
 CONFIG = {
-    # Google Sheets
-    # URL-dən götürün: docs.google.com/spreadsheets/d/ →BU← /edit
-    "spreadsheet_id":         "YOUR_SPREADSHEET_ID_HERE",
-    "sheet_name":             "Sheet1",   # Vərəqin adı
-    "data_start_row":         2,          # Məlumat neçənci sətirdən başlayır
+    # Google Sheets — Railway Variables-dan oxunur
+    "spreadsheet_id":         os.environ.get("SPREADSHEET_ID", ""),
+    "sheet_name":             os.environ.get("SHEET_NAME", "Sheet1"),
+    "data_start_row":         2,
 
     # Google Service Account JSON faylı
     "google_credentials_file": "credentials.json",
 
-    # Telegram bildirişləri
-    # Token: @BotFather → /newbot
-    # Chat ID: @userinfobot-a yazın
-    "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
-    "telegram_chat_id":   "YOUR_CHAT_ID_HERE",
+    # Telegram — Railway Variables-dan oxunur
+    "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+    "telegram_chat_id":   os.environ.get("TELEGRAM_CHAT_ID", ""),
 
     # Bot parametrləri
     "check_interval_minutes": 10,    # neçə dəqiqədən bir yoxlasın
@@ -133,8 +130,8 @@ def record_price_change(barkod: str, old: float, new: float, reason: str):
 # TELEGRAM BİLDİRİŞ
 # ─────────────────────────────────────────────
 def send_telegram(message: str):
-    token   = CONFIG.get("8715061835:AAFFfst36jOUOTt0uycD2bb2NxOiaESWIsc", "")
-    chat_id = CONFIG.get("408932203", "")
+    token   = CONFIG.get("telegram_bot_token", "")
+    chat_id = CONFIG.get("telegram_chat_id", "")
     if not token or "YOUR_" in token:
         return
     try:
@@ -235,9 +232,9 @@ def write_price_to_sheets(sheet_row: int, new_price: float) -> bool:
     """Sheets-in G sütununa yeni qiyməti yazır."""
     try:
         service = get_sheets_service(readonly=False)
-        cell = f"{CONFIG['Unistore Umico']}!{PRICE_WRITE_COL}{sheet_row}"
+        cell = f"{CONFIG['sheet_name']}!{PRICE_WRITE_COL}{sheet_row}"
         service.spreadsheets().values().update(
-            spreadsheetId=CONFIG["12aX3XdWeNtGsV5znEE46Z6lFJn_-YeGK"],
+            spreadsheetId=CONFIG["spreadsheet_id"],
             range=cell,
             valueInputOption="RAW",
             body={"values": [[new_price]]},
