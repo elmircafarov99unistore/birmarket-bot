@@ -66,7 +66,9 @@ COL = {
     "olke": 4, "say": 5, "endirimli": 6,
     "qiymet": 7, "tesvir": 8, "start": 9,
     "finish": 10, "taksit": 11, "aylar": 12,
-    "min_qiymet": 13, "max_qiymet": 14,
+    "url": 13,        # N — məhsulun Birmarket URL-i
+    "min_qiymet": 14, # O — min qiymət
+    "max_qiymet": 15, # P — max qiymət
 }
 
 
@@ -207,7 +209,7 @@ def load_products() -> list:
         for i, raw_row in enumerate(ws.iter_rows(min_row=CONFIG["data_start_row"], values_only=True)):
             row = [str(c).strip() if c is not None else "" for c in raw_row]
 
-            while len(row) <= COL["max_qiymet"]:
+            while len(row) <= COL["max_qiymet"]:  # P sütunu = index 15
                 row.append("")
 
             barkod = row[COL["barkod"]].strip()
@@ -229,6 +231,8 @@ def load_products() -> list:
             model = row[COL["model"]].strip()
             name  = f"{brend} {model}".strip() or barkod
 
+            product_url = row[COL["url"]].strip() if len(row) > COL["url"] else ""
+
             products.append({
                 "barkod":        barkod,
                 "name":          name,
@@ -236,6 +240,7 @@ def load_products() -> list:
                 "min_price":     min_p,
                 "max_price":     max_p,
                 "sheet_row":     i + CONFIG["data_start_row"],
+                "url":           product_url,
             })
 
         log.info(f"📦 {len(products)} məhsul oxundu.")
@@ -268,10 +273,10 @@ def write_price(sheet_row: int, new_price: float) -> bool:
 # ─────────────────────────────────────────────
 # RƏQİB QİYMƏT SCRAPER
 # ─────────────────────────────────────────────
-def get_competitor_prices(barkod: str, my_price: float) -> list:
+def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -> list:
     prices = []
     try:
-        url = f"https://birmarket.az/search?q={barkod}"
+        url = product_url if product_url else f"https://birmarket.az/search?q={barkod}"
         resp = requests.get(url, timeout=15, headers={
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
         })
@@ -351,7 +356,7 @@ def run_check():
 
         log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
 
-        comp_prices = get_competitor_prices(barkod, current)
+        comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
         if not comp_prices:
             log.warning(f"  ⚠️  Rəqib tapılmadı.")
             time.sleep(1)
