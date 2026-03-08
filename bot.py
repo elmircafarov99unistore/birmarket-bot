@@ -339,10 +339,11 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
 
         # Əgər digər satıcı bloku yoxdursa — əsas qiymətə bax (tək satıcı)
         if not seller_blocks:
-            # Əsas satıcı adını yoxla
-            main_seller = soup.find("div", class_=lambda c: c and "text-[13px]" in (c if isinstance(c, str) else " ".join(c)))
-            seller_name = main_seller.get_text(strip=True).lower() if main_seller else ""
-            if "unistore" not in seller_name:
+            # Əsas satıcı adını yoxla — bütün mətni tara
+            page_text = soup.get_text(separator=" ", strip=True).lower()
+            if "unistore" in page_text:
+                log.info(f"  ℹ️  Tək satıcı — özümüzük, rəqib yoxdur.")
+            else:
                 for el in soup.select('span[data-info="item-desc-price-new"]'):
                     text = re.sub(r"[^\d.,\s]", "", el.get_text(strip=True)).replace(",", ".").replace(" ", "")
                     try:
@@ -351,8 +352,6 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
                             prices.append(p)
                     except ValueError:
                         pass
-            else:
-                log.info(f"  ℹ️  Tək satıcı — özümüzük, rəqib yoxdur.")
 
         # 2. Meta itemprop
         if not prices:
