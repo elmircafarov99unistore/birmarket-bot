@@ -162,7 +162,7 @@ def upload_excel(data: bytes) -> bool:
     """Dəyişdirilmiş Excel faylını Google Drive-a yükləyir."""
     try:
         file_id = get_file_id()
-        creds = get_credentials(["https://www.googleapis.com/auth/drive.file"])
+        creds = get_credentials(["https://www.googleapis.com/auth/drive"])
         creds.refresh(Request())
 
         upload_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
@@ -175,7 +175,11 @@ def upload_excel(data: bytes) -> bool:
             data=data,
             timeout=30,
         )
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            return True
+        else:
+            log.error(f"❌ Upload HTTP xətası: {resp.status_code} — {resp.text[:300]}")
+            return False
     except Exception as e:
         log.error(f"❌ Upload xətası: {e}")
         return False
