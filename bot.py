@@ -2,17 +2,14 @@
 Birmarket.az Qiymət İzləmə Botu
 ================================
 İş prinsipi:
-  1. Google Sheets-dən məhsulları oxuyur (barkod, qiymət, min/max limit)
-  2. Birmarket-də hər məhsulun rəqib qiymətlərini tapır
+  1. Google Drive-dakı Excel faylını yükləyir
+  2. Birmarket-də rəqib qiymətlərini tapır
   3. Yeni qiyməti hesablayır (min/max limitə görə)
-  4. Google Sheets-in G sütununa (Endirimli qiymət) yeni qiyməti yazır
-  5. Umico biznes profilində avtomatik dəyişir
+  4. Excel faylının G sütununa yeni qiyməti yazır
+  5. Faylı Google Drive-a geri yükləyir → Umico avtomatik dəyişir
 
 Quraşdırma:
     pip install -r requirements.txt
-
-İstifadə:
-    python bot.py
 """
 
 import json
@@ -25,67 +22,56 @@ import requests
 from datetime import datetime
 from typing import Optional
 from bs4 import BeautifulSoup
+from io import BytesIO
+import openpyxl
 
-# Google Sheets
-from googleapiclient.discovery import build
+# Google Auth
 from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
 
 
 # ─────────────────────────────────────────────
-# KONFIQURASIYA — buraya öz məlumatlarınızı yazın
+# KONFIQURASIYA
 # ─────────────────────────────────────────────
 CONFIG = {
-    # Google Sheets — Railway Variables-dan oxunur
-    "spreadsheet_id":         os.environ.get("SPREADSHEET_ID", ""),
-    "sheet_name":             os.environ.get("SHEET_NAME", "Sheet1"),
-    "data_start_row":         2,
+    # Excel faylının Google Drive paylaşma linki
+    "excel_file_url": os.environ.get("EXCEL_FILE_URL", ""),
 
-    # Google Service Account JSON faylı
-    "google_credentials_file": "credentials.json",
+    # Vərəqin adı (aşağıdakı tab)
+    "sheet_name": os.environ.get("SHEET_NAME", "Əsas"),
 
-    # Telegram — Railway Variables-dan oxunur
+    # Məlumat neçənci sətirdən başlayır (1=başlıq)
+    "data_start_row": 2,
+
+    # Telegram
     "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat_id":   os.environ.get("TELEGRAM_CHAT_ID", ""),
 
     # Bot parametrləri
-    "check_interval_minutes": 10,    # neçə dəqiqədən bir yoxlasın
-    "price_undercut":         0.01,  # rəqibdən neçə manat ucuz olsun
-    "sheets_reload_interval": 30,    # Sheets-dən neçə dəqiqədən bir yenilənsin
+    "check_interval_minutes": 10,
+    "price_undercut":         0.01,
 
     "log_file": "birmarket_bot.log",
 }
 
 # ─────────────────────────────────────────────
-# SHEETS SÜTUN XƏRİTƏSİ
-# A=Barkod  B=MPN     C=Model  D=Brend
-# E=Ölkə   F=Say     G=Endirimli qiymət ← BOT BURA YAZIR
-# H=Qiymət I=Təsvir  J=Start  K=Finiş
-# L=Taksit M=Aylar   N=Min ₼  O=Max ₼
+# SÜTUN XƏRİTƏSİ
+# A=Barkod B=MPN C=Model D=Brend E=Ölkə
+# F=Say G=Endirimli← BOT BURA YAZIR
+# H=Qiymət I=Təsvir J=Start K=Finiş
+# L=Taksit M=Aylar N=Min ₼ O=Max ₼
 # ─────────────────────────────────────────────
 COL = {
-    "barkod":           0,   # A
-    "mpn":              1,   # B
-    "model":            2,   # C
-    "brend":            3,   # D
-    "olke":             4,   # E
-    "say":              5,   # F
-    "endirimli":        6,   # G  ← bot bu sütuna yazır
-    "qiymet":           7,   # H
-    "tesvir":           8,   # I
-    "start":            9,   # J
-    "finish":           10,  # K
-    "taksit":           11,  # L
-    "aylar":            12,  # M
-    "min_qiymet":       13,  # N
-    "max_qiymet":       14,  # O
+    "barkod": 0, "mpn": 1, "model": 2, "brend": 3,
+    "olke": 4, "say": 5, "endirimli": 6,
+    "qiymet": 7, "tesvir": 8, "start": 9,
+    "finish": 10, "taksit": 11, "aylar": 12,
+    "min_qiymet": 13, "max_qiymet": 14,
 }
-
-# G sütununun hərfi (yazma üçün)
-PRICE_WRITE_COL = "G"
 
 
 # ─────────────────────────────────────────────
-# LOG SİSTEMİ
+# LOG
 # ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -99,7 +85,7 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# QİYMƏT TARİXÇƏSİ
+# TARİXÇƏ
 # ─────────────────────────────────────────────
 HISTORY_FILE = "price_history.json"
 
@@ -118,16 +104,14 @@ def record_price_change(barkod: str, old: float, new: float, reason: str):
     if barkod not in h:
         h[barkod] = []
     h[barkod].append({
-        "time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "old_price": old,
-        "new_price": new,
-        "reason":    reason,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "old_price": old, "new_price": new, "reason": reason,
     })
     save_history(h)
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM BİLDİRİŞ
+# TELEGRAM
 # ─────────────────────────────────────────────
 def send_telegram(message: str):
     token   = CONFIG.get("telegram_bot_token", "")
@@ -135,62 +119,94 @@ def send_telegram(message: str):
     if not token or "YOUR_" in token:
         return
     try:
-        resp = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             timeout=10,
         )
-        if resp.status_code == 200:
-            log.info("📨 Telegram bildirişi göndərildi.")
-        else:
-            log.warning(f"Telegram xətası: {resp.status_code}")
+        log.info("📨 Telegram bildirişi göndərildi.")
     except Exception as e:
-        log.warning(f"Telegram göndərilə bilmədi: {e}")
+        log.warning(f"Telegram xətası: {e}")
 
 
 # ─────────────────────────────────────────────
-# GOOGLE SHEETS — OXUMA
+# GOOGLE CREDENTIALS
 # ─────────────────────────────────────────────
-def get_sheets_service(readonly=True):
-    scope = (
-        "https://www.googleapis.com/auth/spreadsheets.readonly"
-        if readonly else
-        "https://www.googleapis.com/auth/spreadsheets"
-    )
-    # Railway-də GOOGLE_CREDENTIALS variable-dan oxu
-    # Yereldə credentials.json faylından oxu
+def get_credentials(scopes: list) -> Credentials:
     google_creds_json = os.environ.get("GOOGLE_CREDENTIALS", "")
-    if google_creds_json:
-        import json as _json
-        from google.oauth2.service_account import Credentials as _Creds
-        info = _json.loads(google_creds_json)
-        creds = _Creds.from_service_account_info(info, scopes=[scope])
-    else:
-        creds = Credentials.from_service_account_file(
-            CONFIG["google_credentials_file"],
-            scopes=[scope],
-        )
-    return build("sheets", "v4", credentials=creds)
+    if not google_creds_json:
+        raise Exception("GOOGLE_CREDENTIALS environment variable tapılmadı!")
+    info = json.loads(google_creds_json)
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return creds
 
+
+# ─────────────────────────────────────────────
+# EXCEL FAYL — YÜKLƏ VƏ YAZ
+# ─────────────────────────────────────────────
+def get_file_id() -> str:
+    url = CONFIG["excel_file_url"]
+    return url.split("/d/")[1].split("/")[0]
+
+def download_excel() -> bytes:
+    """Google Drive-dan Excel faylını yükləyir."""
+    file_id = get_file_id()
+    export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+    resp = requests.get(export_url, timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+def upload_excel(data: bytes) -> bool:
+    """Dəyişdirilmiş Excel faylını Google Drive-a yükləyir."""
+    try:
+        file_id = get_file_id()
+        creds = get_credentials(["https://www.googleapis.com/auth/drive.file"])
+        creds.refresh(Request())
+
+        upload_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
+        resp = requests.patch(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {creds.token}",
+                "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            },
+            data=data,
+            timeout=30,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        log.error(f"❌ Upload xətası: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────
+# MƏHSUL OXUMA
+# ─────────────────────────────────────────────
 def to_float(val, default=0.0) -> float:
     try:
         return float(str(val).replace(",", ".").replace(" ", "").replace("₼", ""))
     except (ValueError, TypeError):
         return default
 
-def load_products_from_sheets() -> list:
-    """Sheets-dən bütün məhsulları oxuyur."""
+def load_products() -> list:
+    """Excel faylından məhsulları oxuyur."""
     products = []
     try:
-        service = get_sheets_service(readonly=True)
-        range_name = f"{CONFIG['sheet_name']}!A{CONFIG['data_start_row']}:O"
-        result = service.spreadsheets().values().get(
-            spreadsheetId=CONFIG["spreadsheet_id"],
-            range=range_name,
-        ).execute()
+        excel_data = download_excel()
+        wb = openpyxl.load_workbook(BytesIO(excel_data), read_only=True, data_only=True)
 
-        rows = result.get("values", [])
-        for i, row in enumerate(rows):
+        sheet_name = CONFIG.get("sheet_name", "Əsas")
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+        else:
+            ws = wb.active
+            log.warning(f"⚠️ '{sheet_name}' vərəqi tapılmadı, '{ws.title}' istifadə edilir.")
+
+        log.info(f"📋 Vərəq: {ws.title}")
+
+        for i, raw_row in enumerate(ws.iter_rows(min_row=CONFIG["data_start_row"], values_only=True)):
+            row = [str(c).strip() if c is not None else "" for c in raw_row]
+
             while len(row) <= COL["max_qiymet"]:
                 row.append("")
 
@@ -198,17 +214,14 @@ def load_products_from_sheets() -> list:
             if not barkod:
                 continue
 
-            qiymet     = to_float(row[COL["qiymet"]])
-            endirimli  = to_float(row[COL["endirimli"]])
-            min_p      = to_float(row[COL["min_qiymet"]])
-            max_p      = to_float(row[COL["max_qiymet"]])
+            qiymet    = to_float(row[COL["qiymet"]])
+            endirimli = to_float(row[COL["endirimli"]])
+            min_p     = to_float(row[COL["min_qiymet"]])
+            max_p     = to_float(row[COL["max_qiymet"]])
 
-            # Cari qiymət: endirimli varsa onu, yoxsa əsas qiyməti götür
             current = endirimli if endirimli > 0 else qiymet
-
             if current <= 0 or min_p <= 0:
                 continue
-
             if max_p <= 0:
                 max_p = current * 2
 
@@ -216,41 +229,39 @@ def load_products_from_sheets() -> list:
             model = row[COL["model"]].strip()
             name  = f"{brend} {model}".strip() or barkod
 
-            # Sheets-də bu sətrin real nömrəsi (yazma üçün lazım)
-            sheet_row = i + CONFIG["data_start_row"]
-
             products.append({
                 "barkod":        barkod,
                 "name":          name,
                 "current_price": current,
                 "min_price":     min_p,
                 "max_price":     max_p,
-                "sheet_row":     sheet_row,
+                "sheet_row":     i + CONFIG["data_start_row"],
             })
 
-        log.info(f"📋 Sheets-dən {len(products)} məhsul oxundu.")
+        log.info(f"📦 {len(products)} məhsul oxundu.")
     except Exception as e:
-        log.error(f"❌ Sheets oxuma xətası: {e}")
+        log.error(f"❌ Məhsul oxuma xətası: {e}")
     return products
 
 
-# ─────────────────────────────────────────────
-# GOOGLE SHEETS — YAZMA (G sütunu)
-# ─────────────────────────────────────────────
-def write_price_to_sheets(sheet_row: int, new_price: float) -> bool:
-    """Sheets-in G sütununa yeni qiyməti yazır."""
+def write_price(sheet_row: int, new_price: float) -> bool:
+    """Excel faylının G sütununa yeni qiyməti yazır."""
     try:
-        service = get_sheets_service(readonly=False)
-        cell = f"{CONFIG['sheet_name']}!{PRICE_WRITE_COL}{sheet_row}"
-        service.spreadsheets().values().update(
-            spreadsheetId=CONFIG["spreadsheet_id"],
-            range=cell,
-            valueInputOption="RAW",
-            body={"values": [[new_price]]},
-        ).execute()
-        return True
+        excel_data = download_excel()
+        wb = openpyxl.load_workbook(BytesIO(excel_data))
+
+        sheet_name = CONFIG.get("sheet_name", "Əsas")
+        ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
+
+        ws.cell(row=sheet_row, column=7, value=new_price)  # G = 7
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        return upload_excel(output.read())
     except Exception as e:
-        log.error(f"❌ Sheets yazma xətası (sətir {sheet_row}): {e}")
+        log.error(f"❌ Qiymət yazma xətası (sətir {sheet_row}): {e}")
         return False
 
 
@@ -258,13 +269,11 @@ def write_price_to_sheets(sheet_row: int, new_price: float) -> bool:
 # RƏQİB QİYMƏT SCRAPER
 # ─────────────────────────────────────────────
 def get_competitor_prices(barkod: str, my_price: float) -> list:
-    """Birmarket-də barkodla axtarır, rəqib qiymətlərini qaytarır."""
     prices = []
     try:
         url = f"https://birmarket.az/search?q={barkod}"
         resp = requests.get(url, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
         })
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -288,10 +297,8 @@ def get_competitor_prices(barkod: str, my_price: float) -> list:
                         prices.append(p)
                 except ValueError:
                     pass
-
     except Exception as e:
         log.warning(f"Scrape xətası [{barkod}]: {e}")
-
     return prices
 
 
@@ -301,56 +308,32 @@ def get_competitor_prices(barkod: str, my_price: float) -> list:
 def calculate_new_price(current: float, comp_prices: list, min_p: float, max_p: float) -> Optional[float]:
     if not comp_prices:
         return None
-
-    # Özümüzün qiymətini çıxar
     others = [p for p in comp_prices if abs(p - current) > 0.05]
     if not others:
         return None
-
     cheapest = min(others)
-
-    # Artıq ucuzuqsa — dəyişiklik yoxdur
     if current < cheapest:
         return None
-
     target = cheapest - CONFIG["price_undercut"]
-
-    # Limit qoruması
     if target < min_p:
         log.info(f"  ⚠️  Min limitə çatıldı → {min_p:.2f}₼")
         target = min_p
-
     if target > max_p:
         target = max_p
-
     if abs(target - current) < 0.01:
         return None
-
     return round(target, 2)
 
 
 # ─────────────────────────────────────────────
 # ƏSAS YOXLAMA
 # ─────────────────────────────────────────────
-_products_cache: list = []
-_last_load: float = 0.0
-
-def get_products() -> list:
-    global _products_cache, _last_load
-    interval = CONFIG["sheets_reload_interval"] * 60
-    if not _products_cache or (time.time() - _last_load) > interval:
-        log.info("🔄 Sheets-dən məhsullar yüklənir...")
-        _products_cache = load_products_from_sheets()
-        _last_load = time.time()
-    return _products_cache
-
-
 def run_check():
     log.info("=" * 55)
     log.info(f"🚀 Yoxlama — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 55)
 
-    products = get_products()
+    products = load_products()
     if not products:
         log.error("❌ Məhsul siyahısı boşdur!")
         return
@@ -368,7 +351,6 @@ def run_check():
 
         log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
 
-        # Rəqib qiymətlərini tap
         comp_prices = get_competitor_prices(barkod, current)
         if not comp_prices:
             log.warning(f"  ⚠️  Rəqib tapılmadı.")
@@ -379,7 +361,6 @@ def run_check():
         if others:
             log.info(f"  📊 Rəqiblər: {sorted(others)}")
 
-        # Yeni qiymət hesabla
         new_price = calculate_new_price(current, comp_prices, min_p, max_p)
         if new_price is None:
             log.info(f"  ✅ Dəyişiklik lazım deyil.")
@@ -389,22 +370,21 @@ def run_check():
         cheapest = min(others) if others else current
         log.info(f"  💰 {current:.2f}₼ → {new_price:.2f}₼")
 
-        # Sheets-ə yaz → Umico avtomatik dəyişir
-        success = write_price_to_sheets(row, new_price)
+        success = write_price(row, new_price)
         if success:
             record_price_change(barkod, current, new_price, f"Rəqib: {cheapest:.2f}₼")
             p["current_price"] = new_price
             updated += 1
-            log.info(f"  ✅ Sheets-ə yazıldı! (Umico avtomatik dəyişəcək)")
+            log.info(f"  ✅ Yeniləndi!")
             send_telegram(
                 f"💰 <b>{name}</b>\n"
                 f"{current:.2f}₼ → <b>{new_price:.2f}₼</b>\n"
                 f"🏷 Rəqib: {cheapest:.2f}₼"
             )
         else:
-            log.error(f"  ❌ Sheets-ə yazıla bilmədi!")
+            log.error(f"  ❌ Yazıla bilmədi!")
 
-        time.sleep(2)  # saytı yükləməmək üçün
+        time.sleep(2)
 
     log.info(f"\n✅ Tamamlandı. {updated} məhsul yeniləndi.\n")
     if updated > 0:
@@ -417,7 +397,6 @@ def run_check():
 if __name__ == "__main__":
     log.info("🤖 Birmarket Bot işə salındı")
     log.info(f"⏱️  Yoxlama: hər {CONFIG['check_interval_minutes']} dəq")
-    log.info(f"🔄 Sheets yeniləmə: hər {CONFIG['sheets_reload_interval']} dəq")
     log.info(f"📝 Qiymət yazılır: G sütununa (Endirimli qiymət)")
 
     run_check()
