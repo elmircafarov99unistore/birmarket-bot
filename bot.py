@@ -309,33 +309,50 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
         })
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 1. Birmarket.az əsas selektor
-        CSS_SELECTORS = (
-            'span[data-info="item-desc-price-new"]',  # Birmarket.az əsas qiymət
-            'span[data-info="item-desc-price-old"]',
-            ".product-offer__price",
-            ".seller-price",
-            ".offer-price",
-            ".price-value",
-            ".product__price",
-            ".product-price",
-            "[data-price]",
-            ".price__current",
-            ".product-card__price",
-            ".offers__price",
-            "span.price",
-            ".new-price",
-            ".current-price",
-        )
-        for el in soup.select(", ".join(CSS_SELECTORS)):
-            raw = el.get("data-price") or el.get_text(strip=True)
-            text = re.sub(r"[^\d.,\s]", "", raw).replace(",", ".").replace(" ", "")
-            try:
-                p = float(text)
-                if 1 < p < 100000:
-                    prices.append(p)
-            except ValueError:
-                pass
+        # Digər satıcıların bloklarını tap (data-info="item-other-seller-list")
+        seller_blocks = soup.find_all(attrs={"data-info": "item-other-seller-list"})
+
+        if seller_blocks:
+            for block in seller_blocks:
+                # Satıcı adını tap
+                name_el = block.find(attrs={"data-info": "item-other-seller-name"})
+                seller_name = name_el.get_text(strip=True).lower() if name_el else ""
+
+                # Unistore-u atla
+                if "unistore" in seller_name:
+                    log.info(f"  ℹ️  Özümüzün listinqi atlandı ({seller_name})")
+                    continue
+
+                # Həmin satıcının qiymətini tap
+                price_el = block.find("span", attrs={"data-info": "item-desc-price-new"})
+                if not price_el:
+                    price_el = block.find(attrs={"data-info": "item-desc-price-new"})
+                if price_el:
+                    text = re.sub(r"[^\d.,\s]", "", price_el.get_text(strip=True)).replace(",", ".").replace(" ", "")
+                    try:
+                        p = float(text)
+                        if 1 < p < 100000:
+                            prices.append(p)
+                            log.info(f"  🏪 {seller_name}: {p:.2f}₼")
+                    except ValueError:
+                        pass
+
+        # Əgər digər satıcı bloku yoxdursa — əsas qiymətə bax (tək satıcı)
+        if not seller_blocks:
+            # Əsas satıcı adını yoxla
+            main_seller = soup.find("div", class_=lambda c: c and "text-[13px]" in (c if isinstance(c, str) else " ".join(c)))
+            seller_name = main_seller.get_text(strip=True).lower() if main_seller else ""
+            if "unistore" not in seller_name:
+                for el in soup.select('span[data-info="item-desc-price-new"]'):
+                    text = re.sub(r"[^\d.,\s]", "", el.get_text(strip=True)).replace(",", ".").replace(" ", "")
+                    try:
+                        p = float(text)
+                        if 1 < p < 100000:
+                            prices.append(p)
+                    except ValueError:
+                        pass
+            else:
+                log.info(f"  ℹ️  Tək satıcı — özümüzük, rəqib yoxdur.")
 
         # 2. Meta itemprop
         if not prices:
