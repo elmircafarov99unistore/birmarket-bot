@@ -157,10 +157,19 @@ def get_sheets_service(readonly=True):
         if readonly else
         "https://www.googleapis.com/auth/spreadsheets"
     )
-    creds = Credentials.from_service_account_file(
-        CONFIG["google_credentials_file"],
-        scopes=[scope],
-    )
+    # Railway-də GOOGLE_CREDENTIALS variable-dan oxu
+    # Yereldə credentials.json faylından oxu
+    google_creds_json = os.environ.get("GOOGLE_CREDENTIALS", "")
+    if google_creds_json:
+        import json as _json
+        from google.oauth2.service_account import Credentials as _Creds
+        info = _json.loads(google_creds_json)
+        creds = _Creds.from_service_account_info(info, scopes=[scope])
+    else:
+        creds = Credentials.from_service_account_file(
+            CONFIG["google_credentials_file"],
+            scopes=[scope],
+        )
     return build("sheets", "v4", credentials=creds)
 
 def to_float(val, default=0.0) -> float:
