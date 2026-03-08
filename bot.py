@@ -197,14 +197,19 @@ def load_products() -> list:
         excel_data = download_excel()
         wb = openpyxl.load_workbook(BytesIO(excel_data), read_only=True, data_only=True)
 
-        sheet_name = CONFIG.get("sheet_name", "Əsas")
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-        else:
+        # Vərəqi tap — encoding problemini önləmək üçün wb.active istifadə edirik
+        sheet_name = CONFIG.get("sheet_name", "")
+        ws = None
+        if sheet_name:
+            for name in wb.sheetnames:
+                if name.strip().lower() == sheet_name.strip().lower():
+                    ws = wb[name]
+                    break
+        if ws is None:
             ws = wb.active
-            log.warning(f"⚠️ '{sheet_name}' vərəqi tapılmadı, '{ws.title}' istifadə edilir.")
-
-        log.info(f"📋 Vərəq: {ws.title}")
+            log.info(f"📋 Aktiv vərəq istifadə edilir: '{ws.title}'")
+        else:
+            log.info(f"📋 Vərəq: {ws.title}")
 
         for i, raw_row in enumerate(ws.iter_rows(min_row=CONFIG["data_start_row"], values_only=True)):
             row = [str(c).strip() if c is not None else "" for c in raw_row]
@@ -212,7 +217,10 @@ def load_products() -> list:
             while len(row) <= COL["max_qiymet"]:  # P sütunu = index 15
                 row.append("")
 
+            # Barkod yoxdursa MPN istifadə et
             barkod = row[COL["barkod"]].strip()
+            if not barkod:
+                barkod = row[COL["mpn"]].strip()
             if not barkod:
                 continue
 
@@ -255,8 +263,15 @@ def write_price(sheet_row: int, new_price: float) -> bool:
         excel_data = download_excel()
         wb = openpyxl.load_workbook(BytesIO(excel_data))
 
-        sheet_name = CONFIG.get("sheet_name", "Əsas")
-        ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
+        sheet_name = CONFIG.get("sheet_name", "")
+        ws = None
+        if sheet_name:
+            for name in wb.sheetnames:
+                if name.strip().lower() == sheet_name.strip().lower():
+                    ws = wb[name]
+                    break
+        if ws is None:
+            ws = wb.active
 
         ws.cell(row=sheet_row, column=7, value=new_price)  # G = 7
 
@@ -282,23 +297,41 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
         else:
             log.warning(f"  ⚠️  URL tapılmadı [{barkod}], axtarış ilə cəhd edilir.")
             url = f"https://birmarket.az/search?q={barkod}"
+
         resp = requests.get(url, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "az,en;q=0.5",
         })
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        for el in soup.select(
-            ".product-offer__price, .seller-price, .offer-price, "
-            "[data-price], .price-value, .product__price"
-        ):
-            text = re.sub(r"[^\d.,]", "", el.get_text(strip=True)).replace(",", ".")
+        # 1. Geniş CSS selektorlar (Birmarket.az üçün)
+        CSS_SELECTORS = (
+            ".product-offer__price",
+            ".seller-price",
+            ".offer-price",
+            ".price-value",
+            ".product__price",
+            ".product-price",
+            "[data-price]",
+            ".price__current",
+            ".product-card__price",
+            ".offers__price",
+            "span.price",
+            ".new-price",
+            ".current-price",
+        )
+        for el in soup.select(", ".join(CSS_SELECTORS)):
+            raw = el.get("data-price") or el.get_text(strip=True)
+            text = re.sub(r"[^\d.,]", "", raw).replace(",", ".")
             try:
                 p = float(text)
-                if p > 0:
+                if 1 < p < 100000:
                     prices.append(p)
             except ValueError:
                 pass
 
+        # 2. Meta itemprop
         if not prices:
             for meta in soup.select("meta[itemprop='price']"):
                 try:
@@ -307,6 +340,42 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
                         prices.append(p)
                 except ValueError:
                     pass
+
+        # 3. JSON-LD strukturlu data
+        if not prices:
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    data = json.loads(script.string or "")
+                    # Tək məhsul
+                    offers = data.get("offers", {})
+                    if isinstance(offers, dict):
+                        p = float(offers.get("price", 0))
+                        if p > 0:
+                            prices.append(p)
+                    elif isinstance(offers, list):
+                        for o in offers:
+                            p = float(o.get("price", 0))
+                            if p > 0:
+                                prices.append(p)
+                except Exception:
+                    pass
+
+        # 4. Regex ilə HTML-dən qiymət axtar (son çarə)
+        if not prices:
+            matches = re.findall(r'"price"\s*:\s*"?([\d.]+)"?', resp.text)
+            for m in matches:
+                try:
+                    p = float(m)
+                    if 1 < p < 100000:
+                        prices.append(p)
+                except ValueError:
+                    pass
+
+        if prices:
+            log.info(f"  🔎 Tapılan qiymətlər: {sorted(set(prices))}")
+        else:
+            log.debug(f"  HTML nümunə (500 simvol): {resp.text[:500]}")
+
     except Exception as e:
         log.warning(f"Scrape xətası [{barkod}]: {e}")
     return prices
@@ -361,7 +430,7 @@ def run_check():
 
         log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
 
-        comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
+        comp_prices = get_competitor_prices(p.get("url", "") or barkod, current, p.get("url", ""))
         if not comp_prices:
             log.warning(f"  ⚠️  Rəqib tapılmadı.")
             time.sleep(1)
