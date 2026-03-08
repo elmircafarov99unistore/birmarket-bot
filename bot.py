@@ -430,7 +430,7 @@ def run_check():
 
         log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
 
-        comp_prices = get_competitor_prices(p.get("url", "") or barkod, current, p.get("url", ""))
+        comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
         if not comp_prices:
             log.warning(f"  ⚠️  Rəqib tapılmadı.")
             time.sleep(1)
