@@ -472,13 +472,7 @@ def process_product(p: dict) -> dict:
 
     comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
     if not comp_prices:
-        log.warning(f"  ⚠️  Rəqib tapılmadı.")
-        # Rəqib yoxdursa max qiymətə qoy
-        if current < max_p:
-            log.info(f"  📈 Rəqib yoxdur — max qiymətə qaldırılır: {max_p:.2f}₼")
-            return {"status": "updated", "direction": "up", "name": name,
-                    "old": current, "new": max_p, "cheapest": max_p,
-                    "row": row, "barkod": barkod}
+        log.warning(f"  ⚠️  Rəqib tapılmadı — qiymət saxlanılır: {current:.2f}₼")
         return {"status": "no_competitor"}
 
     others = [x for x in comp_prices if abs(x - current) > 0.05]
@@ -519,7 +513,8 @@ def run_check():
     log.info(f"📦 {len(products)} məhsul yoxlanılır...\n")
 
     stats = {"updated_down": 0, "updated_up": 0, "best_price": 0, "no_competitor": 0, "error": 0}
-    changes = []  # Bütün dəyişikliklər burada toplanır
+    changes = []
+    updated_results = []
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -531,6 +526,7 @@ def run_check():
 
                 if status == "updated":
                     changes.append({"row": result["row"], "price": result["new"]})
+                    updated_results.append(result)
                     if result["direction"] == "down":
                         stats["updated_down"] += 1
                     else:
@@ -551,13 +547,13 @@ def run_check():
         log.info(f"\n💾 {len(changes)} dəyişiklik Excel-ə yazılır...")
         success = write_prices_batch(changes)
         if success:
-            # Tarixçəyə yaz və Telegram bildirişi göndər
-            for result in [f for f in [fut.result() for fut in futures if not fut.exception()] if f.get("status") == "updated"]:
-                record_price_change(result["barkod"], result["old"], result["new"], f"Rəqib: {result['cheapest']:.2f}₼")
+            for result in updated_results:
+                cheapest = result.get('cheapest', result['new'])
+                record_price_change(result["barkod"], result["old"], result["new"], f"Rəqib: {cheapest:.2f}₼")
                 send_telegram(
                     f"💰 <b>{result['name']}</b>\n"
                     f"{result['old']:.2f}₼ → <b>{result['new']:.2f}₼</b>\n"
-                    f"🏷 Rəqib: {result['cheapest']:.2f}₼"
+                    f"🏷 Rəqib: {cheapest:.2f}₼"
                 )
         else:
             stats["error"] += len(changes)
