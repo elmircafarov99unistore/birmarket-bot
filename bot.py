@@ -318,6 +318,27 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
         # Digər satıcıların bloklarını tap (data-info="item-other-seller-list")
         seller_blocks = soup.find_all(attrs={"data-info": "item-other-seller-list"})
 
+        # Ana satıcının adını tap
+        main_seller_el = soup.find(attrs={"data-info": "item-seller-name"})
+        if not main_seller_el:
+            main_seller_el = soup.find(attrs={"data-info": "item-main-seller-name"})
+        main_seller_name = main_seller_el.get_text(strip=True).lower() if main_seller_el else ""
+
+        # Ana satıcının qiymətini tap (Unistore deyilsə)
+        if main_seller_name and "unistore" not in main_seller_name:
+            main_price_el = soup.find("span", attrs={"data-info": "item-desc-price-new"})
+            if main_price_el:
+                text = re.sub(r"[^\d.,\s]", "", main_price_el.get_text(strip=True)).replace(",", ".").replace(" ", "")
+                try:
+                    p = float(text)
+                    if 1 < p < 100000:
+                        prices.append(p)
+                        log.info(f"  🏪 Ana satıcı ({main_seller_name}): {p:.2f}₼")
+                except ValueError:
+                    pass
+        elif main_seller_name and "unistore" in main_seller_name:
+            log.info(f"  ℹ️  Ana satıcı özümüzük ({main_seller_name}), əsas qiymət atlandı")
+
         if seller_blocks:
             for block in seller_blocks:
                 # Satıcı adını tap
@@ -344,7 +365,7 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
                         pass
 
         # Əgər digər satıcı bloku yoxdursa — əsas qiymətə bax (tək satıcı)
-        if not seller_blocks:
+        if not seller_blocks and not prices:
             # Əsas satıcı adını yoxla — bütün mətni tara
             page_text = soup.get_text(separator=" ", strip=True).lower()
             if "unistore" in page_text:
