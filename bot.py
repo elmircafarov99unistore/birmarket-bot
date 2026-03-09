@@ -1,9 +1,9 @@
 """
-Birmarket.az Qiymət İzləmə Botu (Hızlı Sürüm - Requests)
+Birmarket.az Qiymət İzləmə Botu (Hızlı Sürüm - Requests + Gizli Data Okuma)
 ================================
 İş prinsipi:
   1. Google Drive-dakı Excel faylını yükləyir
-  2. Birmarket-də rəqib qiymətlərini tapır (Requests ilə sürətli)
+  2. Birmarket-də rəqib qiymətlərini HTML'in içindeki gizli JSON/JS datasından tapır
   3. Yeni qiyməti hesablayır (min/max limitə görə)
   4. Excel faylının G sütununa yeni qiyməti yazır
   5. Faylı Google Drive-a geri yükləyir → Umico avtomatik dəyişir
@@ -27,7 +27,7 @@ from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
 
 # ─────────────────────────────────────────────
-# KONFIQURASIYA
+# KONFİQURASİYA
 # ─────────────────────────────────────────────
 CONFIG = {
     "excel_file_url": os.environ.get("EXCEL_FILE_URL", ""),
@@ -256,7 +256,7 @@ def write_prices_batch(changes: list) -> bool:
         return False
 
 # ─────────────────────────────────────────────
-# RƏQİB QİYMƏT SCRAPER (HIZLI REQUESTS)
+# RƏQİB QİYMƏT SCRAPER (GİZLİ JSON VE JS OKUYAN SÜRÜM)
 # ─────────────────────────────────────────────
 def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -> list:
     prices = []
@@ -267,8 +267,8 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
             url = f"https://birmarket.az/search?q={barkod}"
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "az-AZ,az;q=0.9,en-US;q=0.8,en;q=0.7",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "az-AZ,az;q=0.9,en-US;q=0.8",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         }
 
@@ -283,31 +283,71 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
             return None
 
         soup = BeautifulSoup(html, "html.parser")
-        seller_blocks = soup.find_all(attrs={"data-info": "item-other-seller-list"})
+        
+        # --- YÖNTEM 1: SEO için olan temiz JSON datasını kontrol et (En kesin yol) ---
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string)
+                data_list = data if isinstance(data, list) else [data]
+                    
+                for item in data_list:
+                    if item.get("@type") == "Product" and "offers" in item:
+                        offers = item["offers"]
+                        if isinstance(offers, dict):
+                            offers = [offers]
+                        for offer in offers:
+                            seller_name = ""
+                            if "seller" in offer and "name" in offer["seller"]:
+                                seller_name = offer["seller"]["name"].lower()
+                            elif "merchant" in offer and "name" in offer["merchant"]:
+                                seller_name = offer["merchant"]["name"].lower()
+                                
+                            p = float(offer.get("price", 0))
+                            
+                            if "unistore" in seller_name:
+                                continue
+                            if 1 < p < 100000:
+                                prices.append(p)
+                                log.info(f"  🏪 {seller_name}: {p:.2f}₼ (JSON)")
+            except Exception:
+                pass
 
-        if seller_blocks:
-            for block in seller_blocks:
-                name_el = block.find(attrs={"data-info": "item-other-seller-name"})
-                seller_name = name_el.get_text(strip=True).lower() if name_el else ""
+        # --- YÖNTEM 2: Eğer JSON'da yoksa, NUXT (JavaScript) kodunu parçala ---
+        if not prices:
+            script_text = ""
+            for script in soup.find_all("script"):
+                if script.string and "__NUXT__" in script.string:
+                    script_text = script.string
+                    break
+            
+            if not script_text:
+                script_text = html
 
+            pattern1 = r'(?:"merchantName"|"name"|merchantName|name)\s*:\s*["\']([^"\']+)["\'](?:.{1,150}?)(?:"price"|price)\s*:\s*([\d\.]+)'
+            pattern2 = r'(?:"price"|price)\s*:\s*([\d\.]+)(?:.{1,150}?)(?:"merchantName"|"name"|merchantName|name)\s*:\s*["\']([^"\']+)["\']'
+            
+            found_sellers = {}
+            for name, price in re.findall(pattern1, script_text, re.IGNORECASE | re.DOTALL):
+                found_sellers[name.strip().lower()] = float(price)
+            for price, name in re.findall(pattern2, script_text, re.IGNORECASE | re.DOTALL):
+                found_sellers[name.strip().lower()] = float(price)
+
+            for seller_name, p in found_sellers.items():
                 if "unistore" in seller_name:
                     continue
+                if 1 < p < 100000 and p not in prices:
+                    prices.append(p)
+                    log.info(f"  🏪 {seller_name}: {p:.2f}₼ (JS Data)")
 
-                price_el = block.find("span", attrs={"data-info": "item-desc-price-new"})
-                if not price_el:
-                    price_el = block.find(attrs={"data-info": "item-desc-price-new"})
-                if price_el:
-                    text = re.sub(r"[^\d.,\s]", "", price_el.get_text(strip=True)).replace(",", ".").replace(" ", "")
-                    try:
-                        p = float(text)
-                        if 1 < p < 100000:
-                            prices.append(p)
-                    except ValueError:
-                        pass
-    except Exception:
-        pass
+        if prices:
+            log.info(f"  🔎 Tapılan rəqib qiymətləri: {sorted(set(prices))}")
+        else:
+            log.info(f"  ℹ️  Heç bir gizli datada rəqib tapılmadı (Tək satıcıyıq)")
 
-    return prices
+    except Exception as e:
+        log.warning(f"Scrape xətası [{barkod}]: {e}")
+
+    return list(set(prices))
 
 def calculate_new_price(current: float, comp_prices: list, min_p: float, max_p: float) -> Optional[float]:
     if not comp_prices:
@@ -343,7 +383,7 @@ def process_product(p: dict) -> dict:
     max_p   = p["max_price"]
     row     = p["sheet_row"]
 
-    log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
+    log.info(f"🔍 {name} | Mövcud: {current:.2f}₼ | Min: {min_p:.2f} | Max: {max_p:.2f}")
 
     if current > max_p:
         return {"status": "updated", "direction": "down", "name": name, "old": current, "new": max_p, "cheapest": max_p, "row": row, "barkod": barkod}
@@ -353,6 +393,8 @@ def process_product(p: dict) -> dict:
     comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
     if comp_prices is None:
         return {"status": "error"}
+    
+    # Rəqib yoxdursa max qiymətə qaldırır
     if comp_prices == []:
         if current < max_p:
             return {"status": "updated", "direction": "up", "name": name, "old": current, "new": max_p, "cheapest": max_p, "row": row, "barkod": barkod}
@@ -373,7 +415,7 @@ def process_product(p: dict) -> dict:
 
 def run_check():
     log.info("=" * 55)
-    log.info(f"🚀 Yoxlama (Hızlı Mod) — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"🚀 Yoxlama (Hızlı Mod + JS Veri) — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 55)
 
     products = load_products()
@@ -385,7 +427,7 @@ def run_check():
     updated_results = []
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    # Requests çok hafif olduğu için aynı anda 10 ürün kontrol edilebilir
+    # Sunucuyu yormayacağı için aynı anda 10 ürün kontrol edilebilir
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(process_product, p): p for p in products}
         for future in as_completed(futures):
