@@ -312,16 +312,23 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             page = browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            
+            # YENİLİK: Sürəti artırmaq üçün şəkil, css və fontların yüklənməsini bloklayırıq
+            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "stylesheet", "font", "media"] else route.continue_())
+
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                # YENİLİK: Timeout 30000-dən 60000-ə qaldırıldı
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
             except Exception as te:
                 browser.close()
-                log.warning(f"  ⏱️  Timeout [{barkod}] — qiymət saxlanılır")
+                # YENİLİK: Xətanın dəqiq nə olduğu (te) loglara yazdırılır
+                log.warning(f"  ⏱️  Timeout [{barkod}] — Xəta detalı: {te}")
                 return None  # None = xəta, qiyməti dəyişmə
 
             # Satıcı siyahısı yüklənənə qədər gözlə
             try:
-                page.wait_for_selector('[data-info="item-other-seller-list"]', timeout=5000)
+                # YENİLİK: Gözləmə müddəti 5000-dən 2000-ə salındı
+                page.wait_for_selector('[data-info="item-other-seller-list"]', timeout=2000)
             except Exception:
                 pass
 
@@ -483,7 +490,8 @@ def run_check():
     updated_results = []
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # YENİLİK: max_workers 3-dən 6-ya qaldırıldı ki, eyni anda daha çox məhsul yoxlansın
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(process_product, p): p for p in products}
         for future in as_completed(futures):
             try:
