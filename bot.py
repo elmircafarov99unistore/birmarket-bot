@@ -1,9 +1,9 @@
 """
-Birmarket.az Qiymət İzləmə Botu (Hızlı Sürüm - Requests + Gizli Data Okuma)
+Birmarket.az Qiymət İzləmə Botu (Sürətli Versiya - HTML + Link Oxuyan)
 ================================
 İş prinsipi:
   1. Google Drive-dakı Excel faylını yükləyir
-  2. Birmarket-də rəqib qiymətlərini HTML'in içindeki gizli JSON/JS datasından tapır
+  2. Birmarket-də rəqib qiymətlərini "Digər satıcılar" HTML blokundan oxuyur
   3. Yeni qiyməti hesablayır (min/max limitə görə)
   4. Excel faylının G sütununa yeni qiyməti yazır
   5. Faylı Google Drive-a geri yükləyir → Umico avtomatik dəyişir
@@ -256,7 +256,7 @@ def write_prices_batch(changes: list) -> bool:
         return False
 
 # ─────────────────────────────────────────────
-# RƏQİB QİYMƏT SCRAPER (GİZLİ JSON VE JS OKUYAN SÜRÜM)
+# RƏQİB QİYMƏT SCRAPER (MƏHSUL İÇİ + BÜTÜN SATICILAR BLOKU)
 # ─────────────────────────────────────────────
 def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -> list:
     prices = []
@@ -272,82 +272,85 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         }
 
-        try:
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code != 200:
-                return None
-            html = response.text
-        except requests.exceptions.Timeout:
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code != 200:
             return None
-        except Exception:
-            return None
-
-        soup = BeautifulSoup(html, "html.parser")
         
-        # --- YÖNTEM 1: SEO için olan temiz JSON datasını kontrol et (En kesin yol) ---
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string)
-                data_list = data if isinstance(data, list) else [data]
-                    
-                for item in data_list:
-                    if item.get("@type") == "Product" and "offers" in item:
-                        offers = item["offers"]
-                        if isinstance(offers, dict):
-                            offers = [offers]
-                        for offer in offers:
-                            seller_name = ""
-                            if "seller" in offer and "name" in offer["seller"]:
-                                seller_name = offer["seller"]["name"].lower()
-                            elif "merchant" in offer and "name" in offer["merchant"]:
-                                seller_name = offer["merchant"]["name"].lower()
-                                
-                            p = float(offer.get("price", 0))
-                            
-                            if "unistore" in seller_name:
-                                continue
-                            if 1 < p < 100000:
-                                prices.append(p)
-                                log.info(f"  🏪 {seller_name}: {p:.2f}₼ (JSON)")
-            except Exception:
-                pass
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        # --- YÖNTEM 2: Eğer JSON'da yoksa, NUXT (JavaScript) kodunu parçala ---
-        if not prices:
-            script_text = ""
-            for script in soup.find_all("script"):
-                if script.string and "__NUXT__" in script.string:
-                    script_text = script.string
-                    break
-            
-            if not script_text:
-                script_text = html
+        # Əgər bot axtarış səhifəsindədirsə, ilk məhsulun İÇİNƏ daxil olmalıdır
+        if "/search" in response.url or "/search" in url:
+            import re
+            first_product = soup.find("a", href=re.compile(r"/product/"))
+            if first_product:
+                link = first_product["href"]
+                if not link.startswith("http"):
+                    link = "https://birmarket.az" + link
+                url = link
+                # Məhsulun əsl səhifəsini yükləyirik (Bütün satıcılar burdadır)
+                response = requests.get(url, headers=headers, timeout=15)
+                soup = BeautifulSoup(response.text, "html.parser")
+            else:
+                log.info(f"  ℹ️  Axtarışda məhsul tapılmadı.")
+                return []
 
-            pattern1 = r'(?:"merchantName"|"name"|merchantName|name)\s*:\s*["\']([^"\']+)["\'](?:.{1,150}?)(?:"price"|price)\s*:\s*([\d\.]+)'
-            pattern2 = r'(?:"price"|price)\s*:\s*([\d\.]+)(?:.{1,150}?)(?:"merchantName"|"name"|merchantName|name)\s*:\s*["\']([^"\']+)["\']'
-            
-            found_sellers = {}
-            for name, price in re.findall(pattern1, script_text, re.IGNORECASE | re.DOTALL):
-                found_sellers[name.strip().lower()] = float(price)
-            for price, name in re.findall(pattern2, script_text, re.IGNORECASE | re.DOTALL):
-                found_sellers[name.strip().lower()] = float(price)
-
-            for seller_name, p in found_sellers.items():
+        # --- YÖNTƏM 1: HTML DOM ("Digər satıcılar" bloku) ---
+        seller_blocks = soup.find_all(attrs={"data-info": "item-other-seller-list"})
+        
+        if seller_blocks:
+            for block in seller_blocks:
+                name_el = block.find(attrs={"data-info": "item-other-seller-name"})
+                seller_name = name_el.get_text(strip=True).lower() if name_el else ""
+                
+                # Özümüzü (Unistore) siyahıdan çıxarırıq
                 if "unistore" in seller_name:
                     continue
-                if 1 < p < 100000 and p not in prices:
-                    prices.append(p)
-                    log.info(f"  🏪 {seller_name}: {p:.2f}₼ (JS Data)")
 
+                price_el = block.find("span", attrs={"data-info": "item-desc-price-new"})
+                if not price_el:
+                    price_el = block.find(attrs={"data-info": "item-desc-price-new"})
+                
+                if price_el:
+                    import re
+                    text = re.sub(r"[^\d.,]", "", price_el.get_text(strip=True)).replace(",", ".")
+                    try:
+                        p = float(text)
+                        if 1 < p < 100000:
+                            prices.append(p)
+                            log.info(f"  🏪 {seller_name}: {p:.2f}₼ (HTML Siyahı)")
+                    except ValueError:
+                        pass
+
+        # --- YÖNTƏM 2: HTML-də yoxdursa, SEO JSON Data-sını oxu (Ehtiyat variant) ---
+        if not prices:
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    import json
+                    data = json.loads(script.string)
+                    data_list = data if isinstance(data, list) else [data]
+                    for item in data_list:
+                        if item.get("@type") == "Product" and "offers" in item:
+                            offers = item["offers"]
+                            if isinstance(offers, dict): offers = [offers]
+                            for offer in offers:
+                                seller_name = offer.get("seller", {}).get("name", offer.get("merchant", {}).get("name", "")).lower()
+                                p = float(offer.get("price", 0))
+                                if "unistore" not in seller_name and 1 < p < 100000:
+                                    prices.append(p)
+                                    log.info(f"  🏪 {seller_name}: {p:.2f}₼ (JSON)")
+                except Exception:
+                    pass
+
+        prices = list(set(prices))
         if prices:
-            log.info(f"  🔎 Tapılan rəqib qiymətləri: {sorted(set(prices))}")
+            log.info(f"  🔎 Tapılan rəqib qiymətləri: {sorted(prices)}")
         else:
-            log.info(f"  ℹ️  Heç bir gizli datada rəqib tapılmadı (Tək satıcıyıq)")
+            log.info(f"  ℹ️  'Bütün satıcılar' siyahısı boşdur (Tək satıcıyıq)")
 
     except Exception as e:
         log.warning(f"Scrape xətası [{barkod}]: {e}")
 
-    return list(set(prices))
+    return prices
 
 def calculate_new_price(current: float, comp_prices: list, min_p: float, max_p: float) -> Optional[float]:
     if not comp_prices:
@@ -394,7 +397,7 @@ def process_product(p: dict) -> dict:
     if comp_prices is None:
         return {"status": "error"}
     
-    # Rəqib yoxdursa max qiymətə qaldırır
+    # Rəqib yoxdursa max qiymətə qaldırır (Tek satıcı)
     if comp_prices == []:
         if current < max_p:
             return {"status": "updated", "direction": "up", "name": name, "old": current, "new": max_p, "cheapest": max_p, "row": row, "barkod": barkod}
@@ -415,7 +418,7 @@ def process_product(p: dict) -> dict:
 
 def run_check():
     log.info("=" * 55)
-    log.info(f"🚀 Yoxlama (Hızlı Mod + JS Veri) — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"🚀 Yoxlama (HTML Link Sürümü) — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 55)
 
     products = load_products()
