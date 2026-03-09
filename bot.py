@@ -456,6 +456,18 @@ def process_product(p: dict) -> dict:
 
     log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
 
+    # Qiymət limitləri xaricindədirsə düzəlt
+    if current > max_p:
+        log.info(f"  ⬇️  Qiymət Max-dan yüksəkdir — Max-a endirilir: {max_p:.2f}₼")
+        return {"status": "updated", "direction": "down", "name": name,
+                "old": current, "new": max_p, "cheapest": max_p,
+                "row": row, "barkod": barkod}
+    if current < min_p:
+        log.info(f"  ⬆️  Qiymət Min-dən aşağıdır — Min-ə qaldırılır: {min_p:.2f}₼")
+        return {"status": "updated", "direction": "up", "name": name,
+                "old": current, "new": min_p, "cheapest": min_p,
+                "row": row, "barkod": barkod}
+
     comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
     if not comp_prices:
         log.warning(f"  ⚠️  Rəqib tapılmadı.")
