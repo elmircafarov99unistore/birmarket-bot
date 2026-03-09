@@ -1,6 +1,8 @@
-requests==2.31.0
-beautifulsoup4==4.12.3
-schedule==1.2.1
-openpyxl==3.1.2
-google-auth==2.29.0
-google-auth-httplib2==0.2.0
+requests
+schedule
+openpyxl
+beautifulsoup4
+google-auth
+google-auth-httplib2
+google-api-python-client
+playwright
