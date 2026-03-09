@@ -261,8 +261,8 @@ def load_products() -> list:
     return products
 
 
-def write_price(sheet_row: int, new_price: float) -> bool:
-    """Excel faylının G sütununa yeni qiyməti yazır."""
+def write_prices_batch(changes: list) -> bool:
+    """Bütün dəyişiklikləri bir dəfəyə Excel-ə yazır. changes = [{row, price}, ...]"""
     try:
         excel_data = download_excel()
         wb = openpyxl.load_workbook(BytesIO(excel_data))
@@ -277,15 +277,19 @@ def write_price(sheet_row: int, new_price: float) -> bool:
         if ws is None:
             ws = wb.active
 
-        ws.cell(row=sheet_row, column=8, value=new_price)  # H = 8
+        for change in changes:
+            ws.cell(row=change["row"], column=8, value=change["price"])  # H = 8
 
         output = BytesIO()
         wb.save(output)
         output.seek(0)
 
-        return upload_excel(output.read())
+        success = upload_excel(output.read())
+        if success:
+            log.info(f"✅ {len(changes)} dəyişiklik Excel-ə yazıldı.")
+        return success
     except Exception as e:
-        log.error(f"❌ Qiymət yazma xətası (sətir {sheet_row}): {e}")
+        log.error(f"❌ Batch yazma xətası: {e}")
         return False
 
 
@@ -455,28 +459,31 @@ def process_product(p: dict) -> dict:
     comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
     if not comp_prices:
         log.warning(f"  ⚠️  Rəqib tapılmadı.")
-        return {"updated": False}
+        return {"status": "no_competitor"}
 
     others = [x for x in comp_prices if abs(x - current) > 0.05]
     if others:
         log.info(f"  📊 Rəqiblər: {sorted(others)}")
 
+    cheapest = min(others) if others else current
+
+    # Ən ucuz bizdədir?
+    if not others or current <= cheapest:
+        log.info(f"  ✅ Dəyişiklik lazım deyil.")
+        return {"status": "best_price", "name": name, "current": current}
+
     new_price = calculate_new_price(current, comp_prices, min_p, max_p)
     if new_price is None:
         log.info(f"  ✅ Dəyişiklik lazım deyil.")
-        return {"updated": False}
+        return {"status": "best_price", "name": name, "current": current}
 
-    cheapest = min(others) if others else current
+    # Qiymət artır ya azalır?
+    direction = "up" if new_price > current else "down"
     log.info(f"  💰 {current:.2f}₼ → {new_price:.2f}₼")
 
-    success = write_price(row, new_price)
-    if success:
-        record_price_change(barkod, current, new_price, f"Rəqib: {cheapest:.2f}₼")
-        log.info(f"  ✅ Yeniləndi!")
-        return {"updated": True, "name": name, "old": current, "new": new_price, "cheapest": cheapest}
-    else:
-        log.error(f"  ❌ Yazıla bilmədi!")
-        return {"updated": False}
+    return {"status": "updated", "direction": direction, "name": name,
+            "old": current, "new": new_price, "cheapest": cheapest,
+            "row": row, "barkod": barkod}
 
 
 def run_check():
@@ -490,7 +497,9 @@ def run_check():
         return
 
     log.info(f"📦 {len(products)} məhsul yoxlanılır...\n")
-    updated = 0
+
+    stats = {"updated_down": 0, "updated_up": 0, "best_price": 0, "no_competitor": 0, "error": 0}
+    changes = []  # Bütün dəyişikliklər burada toplanır
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -498,19 +507,59 @@ def run_check():
         for future in as_completed(futures):
             try:
                 result = future.result()
-                if result.get("updated"):
-                    updated += 1
-                    send_telegram(
-                        f"💰 <b>{result['name']}</b>\n"
-                        f"{result['old']:.2f}₼ → <b>{result['new']:.2f}₼</b>\n"
-                        f"🏷 Rəqib: {result['cheapest']:.2f}₼"
-                    )
+                status = result.get("status", "error")
+
+                if status == "updated":
+                    changes.append({"row": result["row"], "price": result["new"]})
+                    if result["direction"] == "down":
+                        stats["updated_down"] += 1
+                    else:
+                        stats["updated_up"] += 1
+                elif status == "best_price":
+                    stats["best_price"] += 1
+                elif status == "no_competitor":
+                    stats["no_competitor"] += 1
+                else:
+                    stats["error"] += 1
+
             except Exception as e:
                 log.error(f"❌ Thread xətası: {e}")
+                stats["error"] += 1
 
-    log.info(f"\n✅ Tamamlandı. {updated} məhsul yeniləndi.\n")
-    if updated > 0:
-        send_telegram(f"✅ BirmarketBot: {updated} məhsulun qiyməti yeniləndi.")
+    # Bütün dəyişiklikləri BİR DƏFƏ Excel-ə yaz
+    if changes:
+        log.info(f"\n💾 {len(changes)} dəyişiklik Excel-ə yazılır...")
+        success = write_prices_batch(changes)
+        if success:
+            # Tarixçəyə yaz və Telegram bildirişi göndər
+            for result in [f for f in [fut.result() for fut in futures if not fut.exception()] if f.get("status") == "updated"]:
+                record_price_change(result["barkod"], result["old"], result["new"], f"Rəqib: {result['cheapest']:.2f}₼")
+                send_telegram(
+                    f"💰 <b>{result['name']}</b>\n"
+                    f"{result['old']:.2f}₼ → <b>{result['new']:.2f}₼</b>\n"
+                    f"🏷 Rəqib: {result['cheapest']:.2f}₼"
+                )
+        else:
+            stats["error"] += len(changes)
+            stats["updated_down"] = 0
+            stats["updated_up"] = 0
+
+    total_updated = stats["updated_down"] + stats["updated_up"]
+    log.info(f"\n✅ Tamamlandı. {total_updated} məhsul yeniləndi.\n")
+
+    # Telegram hesabatı
+    report = (
+        f"📊 <b>Yoxlama Hesabatı</b>\n"
+        f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Ümumi məhsul: <b>{len(products)}</b>\n"
+        f"📉 Qiymət endirildi: <b>{stats['updated_down']}</b>\n"
+        f"📈 Qiymət artırıldı: <b>{stats['updated_up']}</b>\n"
+        f"✅ Ən yaxşı qiymət bizdə: <b>{stats['best_price']}</b>\n"
+        f"🔍 Rəqib tapılmadı: <b>{stats['no_competitor']}</b>\n"
+        f"❌ Xəta: <b>{stats['error']}</b>"
+    )
+    send_telegram(report)
 
 
 # ─────────────────────────────────────────────
