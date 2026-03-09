@@ -312,7 +312,7 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             page = browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
             # Satıcı siyahısı yüklənənə qədər gözlə
             try:
@@ -475,7 +475,7 @@ def run_check():
     updated_results = []
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(process_product, p): p for p in products}
         for future in as_completed(futures):
             try:
