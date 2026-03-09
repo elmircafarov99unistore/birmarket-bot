@@ -299,58 +299,44 @@ def write_prices_batch(changes: list) -> bool:
 # RƏQİB QİYMƏT SCRAPER
 # ─────────────────────────────────────────────
 def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -> list:
+    """Playwright ilə Birmarket səhifəsini açır, satıcı siyahısından rəqib qiymətlərini oxuyur."""
     prices = []
     try:
-        # URL etibarlımı yoxla
         if product_url and product_url.startswith("http"):
             url = product_url
         else:
             log.warning(f"  ⚠️  URL tapılmadı [{barkod}], axtarış ilə cəhd edilir.")
             url = f"https://birmarket.az/search?q={barkod}"
 
-        resp = requests.get(url, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "az,en;q=0.5",
-        })
-        soup = BeautifulSoup(resp.text, "html.parser")
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
-        # Digər satıcıların bloklarını tap (data-info="item-other-seller-list")
+            # Satıcı siyahısı yüklənənə qədər gözlə
+            try:
+                page.wait_for_selector('[data-info="item-other-seller-list"], .all-sellers-list, [class*="seller"]', timeout=8000)
+            except Exception:
+                pass
+
+            html = page.content()
+            browser.close()
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Satıcı bloklarını tap
         seller_blocks = soup.find_all(attrs={"data-info": "item-other-seller-list"})
-
-        # Ana satıcının adını tap
-        main_seller_el = soup.find(attrs={"data-info": "item-seller-name"})
-        if not main_seller_el:
-            main_seller_el = soup.find(attrs={"data-info": "item-main-seller-name"})
-        main_seller_name = main_seller_el.get_text(strip=True).lower() if main_seller_el else ""
-
-        # Ana satıcının qiymətini tap (Unistore deyilsə)
-        if main_seller_name and "unistore" not in main_seller_name:
-            main_price_el = soup.find("span", attrs={"data-info": "item-desc-price-new"})
-            if main_price_el:
-                text = re.sub(r"[^\d.,\s]", "", main_price_el.get_text(strip=True)).replace(",", ".").replace(" ", "")
-                try:
-                    p = float(text)
-                    if 1 < p < 100000:
-                        prices.append(p)
-                        log.info(f"  🏪 Ana satıcı ({main_seller_name}): {p:.2f}₼")
-                except ValueError:
-                    pass
-        elif main_seller_name and "unistore" in main_seller_name:
-            log.info(f"  ℹ️  Ana satıcı özümüzük ({main_seller_name}), əsas qiymət atlandı")
 
         if seller_blocks:
             for block in seller_blocks:
-                # Satıcı adını tap
                 name_el = block.find(attrs={"data-info": "item-other-seller-name"})
                 seller_name = name_el.get_text(strip=True).lower() if name_el else ""
 
-                # Unistore-u atla
                 if "unistore" in seller_name:
                     log.info(f"  ℹ️  Özümüzün listinqi atlandı ({seller_name})")
                     continue
 
-                # Həmin satıcının qiymətini tap
                 price_el = block.find("span", attrs={"data-info": "item-desc-price-new"})
                 if not price_el:
                     price_el = block.find(attrs={"data-info": "item-desc-price-new"})
@@ -364,51 +350,20 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
                     except ValueError:
                         pass
 
-        # seller_blocks JS ilə render olunur, adətən boş gəlir
-        # Fallback: JSON-LD-dən bütün satıcıları oxu (seller adı + qiymət)
-        if not prices:
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string or "")
-                    offers = data.get("offers", {})
-                    offer_list = [offers] if isinstance(offers, dict) else (offers if isinstance(offers, list) else [])
-                    for o in offer_list:
-                        p = float(o.get("price", 0))
-                        seller_info = o.get("seller", {})
-                        seller_n = (seller_info.get("name", "") if isinstance(seller_info, dict) else "").lower()
-                        if p > 0:
-                            if "unistore" in seller_n:
-                                log.info(f"  ℹ️  JSON-LD: özümüzün qiyməti atlandı ({seller_n}: {p:.2f}₼)")
-                            else:
-                                prices.append(p)
-                                log.info(f"  🏪 JSON-LD ({seller_n or 'naməlum'}): {p:.2f}₼")
-                except Exception:
-                    pass
+            if prices:
+                log.info(f"  🔎 Tapılan qiymətlər: {sorted(set(prices))}")
+            else:
+                log.info(f"  ℹ️  Satıcı blokları var amma rəqib tapılmadı (yalnız bizdik)")
 
-        # Meta itemprop — yalnız seller_blocks və JSON-LD boşdursa
-        if not prices:
-            for meta in soup.select("meta[itemprop='price']"):
-                try:
-                    p = float(meta.get("content", "0"))
-                    if p > 0 and abs(p - my_price) > 0.05:
-                        prices.append(p)
-                        log.info(f"  🏪 Meta qiymət: {p:.2f}₼")
-                except ValueError:
-                    pass
-
-        if prices:
-            log.info(f"  🔎 Tapılan qiymətlər: {sorted(set(prices))}")
         else:
-            log.debug(f"  HTML nümunə (500 simvol): {resp.text[:500]}")
+            # Satıcı siyahısı yoxdur — tək satıcıyıq
+            log.info(f"  ℹ️  Satıcı siyahısı yoxdur — tək satıcıyıq")
 
     except Exception as e:
         log.warning(f"Scrape xətası [{barkod}]: {e}")
+
     return prices
 
-
-# ─────────────────────────────────────────────
-# QİYMƏT HESABLAMA
-# ─────────────────────────────────────────────
 def calculate_new_price(current: float, comp_prices: list, min_p: float, max_p: float) -> Optional[float]:
     if not comp_prices:
         return None
@@ -468,8 +423,14 @@ def process_product(p: dict) -> dict:
                 "row": row, "barkod": barkod}
 
     comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
-    if not comp_prices:
-        log.warning(f"  ⚠️  Rəqib tapılmadı — qiymət saxlanılır: {current:.2f}₼")
+    if comp_prices is None or comp_prices == []:
+        # Playwright satıcı siyahısı tapmadı — tək satıcıyıq → max-a qaldır
+        if current < max_p:
+            log.info(f"  📈 Tək satıcıyıq — max qiymətə qaldırılır: {max_p:.2f}₼")
+            return {"status": "updated", "direction": "up", "name": name,
+                    "old": current, "new": max_p, "cheapest": max_p,
+                    "row": row, "barkod": barkod}
+        log.info(f"  ✅ Tək satıcıyıq — qiymət artıq max-dadır.")
         return {"status": "no_competitor"}
 
     others = [x for x in comp_prices if abs(x - current) > 0.05]
