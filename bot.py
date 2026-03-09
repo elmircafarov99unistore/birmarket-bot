@@ -364,59 +364,35 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
                     except ValueError:
                         pass
 
-        # Əgər digər satıcı bloku yoxdursa — əsas qiymətə bax (tək satıcı)
-        if not seller_blocks and not prices:
-            # Əsas satıcı adını yoxla — bütün mətni tara
-            page_text = soup.get_text(separator=" ", strip=True).lower()
-            if "unistore" in page_text:
-                log.info(f"  ℹ️  Tək satıcı — özümüzük, rəqib yoxdur.")
-            else:
-                for el in soup.select('span[data-info="item-desc-price-new"]'):
-                    text = re.sub(r"[^\d.,\s]", "", el.get_text(strip=True)).replace(",", ".").replace(" ", "")
-                    try:
-                        p = float(text)
-                        if 1 < p < 100000:
-                            prices.append(p)
-                    except ValueError:
-                        pass
-
-        # 2. Meta itemprop
-        if not prices:
-            for meta in soup.select("meta[itemprop='price']"):
-                try:
-                    p = float(meta.get("content", "0"))
-                    if p > 0:
-                        prices.append(p)
-                except ValueError:
-                    pass
-
-        # 3. JSON-LD strukturlu data
+        # seller_blocks JS ilə render olunur, adətən boş gəlir
+        # Fallback: JSON-LD-dən bütün satıcıları oxu (seller adı + qiymət)
         if not prices:
             for script in soup.find_all("script", type="application/ld+json"):
                 try:
                     data = json.loads(script.string or "")
-                    # Tək məhsul
                     offers = data.get("offers", {})
-                    if isinstance(offers, dict):
-                        p = float(offers.get("price", 0))
+                    offer_list = [offers] if isinstance(offers, dict) else (offers if isinstance(offers, list) else [])
+                    for o in offer_list:
+                        p = float(o.get("price", 0))
+                        seller_info = o.get("seller", {})
+                        seller_n = (seller_info.get("name", "") if isinstance(seller_info, dict) else "").lower()
                         if p > 0:
-                            prices.append(p)
-                    elif isinstance(offers, list):
-                        for o in offers:
-                            p = float(o.get("price", 0))
-                            if p > 0:
+                            if "unistore" in seller_n:
+                                log.info(f"  ℹ️  JSON-LD: özümüzün qiyməti atlandı ({seller_n}: {p:.2f}₼)")
+                            else:
                                 prices.append(p)
+                                log.info(f"  🏪 JSON-LD ({seller_n or 'naməlum'}): {p:.2f}₼")
                 except Exception:
                     pass
 
-        # 4. Regex ilə HTML-dən qiymət axtar (son çarə)
+        # Meta itemprop — yalnız seller_blocks və JSON-LD boşdursa
         if not prices:
-            matches = re.findall(r'"price"\s*:\s*"?([\d.]+)"?', resp.text)
-            for m in matches:
+            for meta in soup.select("meta[itemprop='price']"):
                 try:
-                    p = float(m)
-                    if 1 < p < 100000:
+                    p = float(meta.get("content", "0"))
+                    if p > 0 and abs(p - my_price) > 0.05:
                         prices.append(p)
+                        log.info(f"  🏪 Meta qiymət: {p:.2f}₼")
                 except ValueError:
                     pass
 
