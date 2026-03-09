@@ -413,8 +413,20 @@ def calculate_new_price(current: float, comp_prices: list, min_p: float, max_p: 
     if not others:
         return None
     cheapest = min(others)
+
     if current < cheapest:
-        return None
+        # Biz ən ucuzuq — qiyməti qaldır (rəqibdən 0.01 aşağı, amma max-dan çox olmasın)
+        target = cheapest - CONFIG["price_undercut"]
+        if target > max_p:
+            target = max_p
+        if target < min_p:
+            target = min_p
+        if abs(target - current) < 0.01:
+            return None
+        log.info(f"  📈 Qiymət artırılır: {current:.2f}₼ → {target:.2f}₼")
+        return round(target, 2)
+
+    # Biz ən ucuz deyilik — aşağı sal
     target = cheapest - CONFIG["price_undercut"]
     if target < min_p:
         log.info(f"  ⚠️  Min limitə çatıldı → {min_p:.2f}₼")
@@ -429,6 +441,44 @@ def calculate_new_price(current: float, comp_prices: list, min_p: float, max_p: 
 # ─────────────────────────────────────────────
 # ƏSAS YOXLAMA
 # ─────────────────────────────────────────────
+def process_product(p: dict) -> dict:
+    """Tək məhsulu yoxlayır — paralel işləmə üçün."""
+    barkod  = p["barkod"]
+    name    = p["name"]
+    current = p["current_price"]
+    min_p   = p["min_price"]
+    max_p   = p["max_price"]
+    row     = p["sheet_row"]
+
+    log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
+
+    comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
+    if not comp_prices:
+        log.warning(f"  ⚠️  Rəqib tapılmadı.")
+        return {"updated": False}
+
+    others = [x for x in comp_prices if abs(x - current) > 0.05]
+    if others:
+        log.info(f"  📊 Rəqiblər: {sorted(others)}")
+
+    new_price = calculate_new_price(current, comp_prices, min_p, max_p)
+    if new_price is None:
+        log.info(f"  ✅ Dəyişiklik lazım deyil.")
+        return {"updated": False}
+
+    cheapest = min(others) if others else current
+    log.info(f"  💰 {current:.2f}₼ → {new_price:.2f}₼")
+
+    success = write_price(row, new_price)
+    if success:
+        record_price_change(barkod, current, new_price, f"Rəqib: {cheapest:.2f}₼")
+        log.info(f"  ✅ Yeniləndi!")
+        return {"updated": True, "name": name, "old": current, "new": new_price, "cheapest": cheapest}
+    else:
+        log.error(f"  ❌ Yazıla bilmədi!")
+        return {"updated": False}
+
+
 def run_check():
     log.info("=" * 55)
     log.info(f"🚀 Yoxlama — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -442,50 +492,21 @@ def run_check():
     log.info(f"📦 {len(products)} məhsul yoxlanılır...\n")
     updated = 0
 
-    for p in products:
-        barkod  = p["barkod"]
-        name    = p["name"]
-        current = p["current_price"]
-        min_p   = p["min_price"]
-        max_p   = p["max_price"]
-        row     = p["sheet_row"]
-
-        log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
-
-        comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
-        if not comp_prices:
-            log.warning(f"  ⚠️  Rəqib tapılmadı.")
-            time.sleep(1)
-            continue
-
-        others = [x for x in comp_prices if abs(x - current) > 0.05]
-        if others:
-            log.info(f"  📊 Rəqiblər: {sorted(others)}")
-
-        new_price = calculate_new_price(current, comp_prices, min_p, max_p)
-        if new_price is None:
-            log.info(f"  ✅ Dəyişiklik lazım deyil.")
-            time.sleep(1)
-            continue
-
-        cheapest = min(others) if others else current
-        log.info(f"  💰 {current:.2f}₼ → {new_price:.2f}₼")
-
-        success = write_price(row, new_price)
-        if success:
-            record_price_change(barkod, current, new_price, f"Rəqib: {cheapest:.2f}₼")
-            p["current_price"] = new_price
-            updated += 1
-            log.info(f"  ✅ Yeniləndi!")
-            send_telegram(
-                f"💰 <b>{name}</b>\n"
-                f"{current:.2f}₼ → <b>{new_price:.2f}₼</b>\n"
-                f"🏷 Rəqib: {cheapest:.2f}₼"
-            )
-        else:
-            log.error(f"  ❌ Yazıla bilmədi!")
-
-        time.sleep(2)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_product, p): p for p in products}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result.get("updated"):
+                    updated += 1
+                    send_telegram(
+                        f"💰 <b>{result['name']}</b>\n"
+                        f"{result['old']:.2f}₼ → <b>{result['new']:.2f}₼</b>\n"
+                        f"🏷 Rəqib: {result['cheapest']:.2f}₼"
+                    )
+            except Exception as e:
+                log.error(f"❌ Thread xətası: {e}")
 
     log.info(f"\n✅ Tamamlandı. {updated} məhsul yeniləndi.\n")
     if updated > 0:
