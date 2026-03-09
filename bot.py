@@ -237,7 +237,7 @@ def load_products() -> list:
             if current <= 0 or min_p <= 0:
                 continue
             if max_p <= 0:
-                max_p = current * 2
+                max_p = round(min_p * 1.1, 2)
 
             brend = row[COL["brend"]].strip()
             model = row[COL["model"]].strip()
