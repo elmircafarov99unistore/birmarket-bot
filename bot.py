@@ -459,6 +459,12 @@ def process_product(p: dict) -> dict:
     comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
     if not comp_prices:
         log.warning(f"  ⚠️  Rəqib tapılmadı.")
+        # Rəqib yoxdursa max qiymətə qoy
+        if current < max_p:
+            log.info(f"  📈 Rəqib yoxdur — max qiymətə qaldırılır: {max_p:.2f}₼")
+            return {"status": "updated", "direction": "up", "name": name,
+                    "old": current, "new": max_p, "cheapest": max_p,
+                    "row": row, "barkod": barkod}
         return {"status": "no_competitor"}
 
     others = [x for x in comp_prices if abs(x - current) > 0.05]
