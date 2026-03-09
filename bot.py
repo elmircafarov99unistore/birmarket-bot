@@ -199,7 +199,7 @@ def load_products() -> list:
     products = []
     try:
         excel_data = download_excel()
-        wb = openpyxl.load_workbook(BytesIO(excel_data), read_only=True, data_only=True)
+        wb = openpyxl.load_workbook(BytesIO(excel_data), data_only=True)
 
         # Vərəqi tap — encoding problemini önləmək üçün wb.active istifadə edirik
         sheet_name = CONFIG.get("sheet_name", "")
@@ -233,7 +233,9 @@ def load_products() -> list:
             min_p     = to_float(row[COL["min_qiymet"]])
             max_p     = to_float(row[COL["max_qiymet"]])
 
-            current = endirimli if endirimli > 0 else qiymet
+            # Bot H sütununa (column=8, index=7) yazır
+            # current = H-dan oxu (botun yazdığı qiymət)
+            current = qiymet if qiymet > 0 else endirimli
             if current <= 0 or min_p <= 0:
                 continue
             if max_p <= 0:
