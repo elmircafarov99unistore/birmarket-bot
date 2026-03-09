@@ -450,7 +450,7 @@ def run_check():
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     # Sunucuyu yormayacağı için aynı anda 10 ürün kontrol edilebilir
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(process_product, p): p for p in products}
         for future in as_completed(futures):
             try:
