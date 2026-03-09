@@ -312,11 +312,16 @@ def get_competitor_prices(barkod: str, my_price: float, product_url: str = "") -
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             page = browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as te:
+                browser.close()
+                log.warning(f"  ⏱️  Timeout [{barkod}] — qiymət saxlanılır")
+                return None  # None = xəta, qiyməti dəyişmə
 
             # Satıcı siyahısı yüklənənə qədər gözlə
             try:
-                page.wait_for_selector('[data-info="item-other-seller-list"], .all-sellers-list, [class*="seller"]', timeout=8000)
+                page.wait_for_selector('[data-info="item-other-seller-list"]', timeout=5000)
             except Exception:
                 pass
 
@@ -423,8 +428,11 @@ def process_product(p: dict) -> dict:
                 "row": row, "barkod": barkod}
 
     comp_prices = get_competitor_prices(barkod, current, p.get("url", ""))
-    if comp_prices is None or comp_prices == []:
-        # Playwright satıcı siyahısı tapmadı — tək satıcıyıq → max-a qaldır
+    if comp_prices is None:
+        # Timeout/xəta — qiyməti dəyişmə
+        return {"status": "error"}
+    if comp_prices == []:
+        # Satıcı siyahısı yoxdur — tək satıcıyıq → max-a qaldır
         if current < max_p:
             log.info(f"  📈 Tək satıcıyıq — max qiymətə qaldırılır: {max_p:.2f}₼")
             return {"status": "updated", "direction": "up", "name": name,
