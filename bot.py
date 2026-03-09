@@ -277,7 +277,7 @@ def write_price(sheet_row: int, new_price: float) -> bool:
         if ws is None:
             ws = wb.active
 
-        ws.cell(row=sheet_row, column=7, value=new_price)  # G = 7
+        ws.cell(row=sheet_row, column=8, value=new_price)  # H = 8
 
         output = BytesIO()
         wb.save(output)
@@ -498,7 +498,7 @@ def run_check():
 if __name__ == "__main__":
     log.info("🤖 Birmarket Bot işə salındı")
     log.info(f"⏱️  Yoxlama: hər {CONFIG['check_interval_minutes']} dəq")
-    log.info(f"📝 Qiymət yazılır: G sütununa (Endirimli qiymət)")
+    log.info(f"📝 Qiymət yazılır: H sütununa (Qiymət)")
 
     run_check()
     schedule.every(CONFIG["check_interval_minutes"]).minutes.do(run_check)
