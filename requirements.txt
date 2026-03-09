@@ -1,7 +1,5 @@
 requests
-schedule
-openpyxl
 beautifulsoup4
+openpyxl
+schedule
 google-auth
-google-auth-httplib2
-google-api-python-client
