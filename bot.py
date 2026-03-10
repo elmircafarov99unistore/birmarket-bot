@@ -191,38 +191,47 @@ def write_prices_batch(changes: list) -> bool:
         return False
 
 
-def get_page_price(url: str) -> Optional[float]:
-    """
-    Birmarket səhifəsindən ən aşağı (ana) qiyməti oxuyur.
-    Bütün satıcıların qiymətlərini taparaq minimumu qaytarır.
-    """
+def get_product_id(url: str):
+    m = re.search(r"/product/(\d+)", url)
+    return m.group(1) if m else None
+
+
+def get_page_price(url: str):
+    """Birmarket API və JSON-LD ilə ən aşağı qiyməti oxuyur."""
     try:
+        product_id = get_product_id(url)
+
+        # 1. Birmarket satıcı API-si
+        if product_id:
+            api_url = f"https://birmarket.az/api/v1/products/{product_id}/sellers"
+            try:
+                r = requests.get(api_url, headers=HEADERS, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    prices = []
+                    items = data if isinstance(data, list) else data.get("data", data.get("sellers", data.get("items", [])))
+                    if isinstance(items, list):
+                        for s in items:
+                            for key in ("price", "currentPrice", "current_price", "amount"):
+                                p = s.get(key)
+                                if p:
+                                    try:
+                                        prices.append(float(p))
+                                    except:
+                                        pass
+                                    break
+                    if prices:
+                        log.info(f"  📡 API: {sorted(round(x,2) for x in prices)} → min: {min(prices)}")
+                        return min(prices)
+            except Exception as e:
+                log.warning(f"  API xətası: {e}")
+
+        # 2. JSON-LD fallback
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
-            log.warning(f"  HTTP {resp.status_code}")
             return None
 
-        text = resp.text
-        all_prices = []
-
-        # 1. Bütün "price" dəyərlərini HTML-dən çək (Nuxt data içindən)
-        # Birmarket Nuxt.js işlədir, qiymətlər JS-də gizlidir
-        # Regex ilə bütün qiymət oxşar dəyərləri tap
-        price_patterns = [
-            r'"price":([\.\d]+)',
-            r'"price":"([\d]+\.?[\d]*)"',
-        ]
-        for pattern in price_patterns:
-            for m in re.finditer(pattern, text):
-                try:
-                    p = float(m.group(1))
-                    if 1 < p < 100000:  # məntiqli qiymət aralığı
-                        all_prices.append(p)
-                except:
-                    pass
-
-        # 2. JSON-LD
-        soup = BeautifulSoup(text, "html.parser")
+        soup = BeautifulSoup(resp.text, "html.parser")
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(script.string or "")
@@ -230,28 +239,22 @@ def get_page_price(url: str) -> Optional[float]:
                 if isinstance(offers, dict):
                     p = float(offers.get("price", 0))
                     if p > 1:
-                        all_prices.append(p)
+                        log.info(f"  📄 JSON-LD: {p}")
+                        return p
                 elif isinstance(offers, list):
-                    for o in offers:
-                        p = float(o.get("price", 0))
-                        if p > 1:
-                            all_prices.append(p)
+                    prices = [float(o.get("price", 0)) for o in offers if o.get("price")]
+                    if prices:
+                        log.info(f"  📄 JSON-LD: {sorted(round(x,2) for x in prices)} → min: {min(prices)}")
+                        return min(prices)
             except:
                 pass
 
-        if not all_prices:
-            log.warning(f"  ⚠️ Qiymət tapılmadı")
-            return None
-
-        # Ən aşağı qiyməti götür
-        min_price = min(all_prices)
-        log.info(f"  📄 Tapılan qiymətlər: {sorted(set(round(x,2) for x in all_prices))[:5]} → min: {min_price}")
-        return min_price
+        log.warning(f"  ⚠️ Qiymət tapılmadı")
+        return None
 
     except Exception as e:
         log.warning(f"  Scrape xətası [{type(e).__name__}]: {e}")
         return None
-
 
 def process_product(p: dict) -> dict:
     key     = p["key"]
