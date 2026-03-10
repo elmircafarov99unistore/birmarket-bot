@@ -11,22 +11,16 @@ EXCEL_FILE_URL = os.environ.get("EXCEL_FILE_URL", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 PRICE_UNDERCUT = 0.01
-MAX_WORKERS = 3  # Serverin donmaması üçün
+MAX_WORKERS = 3 
 
-# Sütunlar (Excel-ə əsasən: H=8, N=14, O=15, P=16)
-COL_QIYMET = 8   # H sütunu (Qiymət yazılan yer)
-COL_URL = 14     # N sütunu (Məhsul linki)
-COL_MIN = 15     # O sütunu (Minimum qiymət)
-COL_MAX = 16     # P sütunu (Maksimum qiymət)
+# Sütunlar (Excel-ə əsasən tənzimləndi)
+COL_QIYMET = 8   # H
+COL_URL = 14     # N
+COL_MIN = 15     # O
+COL_MAX = 16     # P
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
-def send_telegram(msg):
-    if TELEGRAM_BOT_TOKEN:
-        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
-                           json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
-        except: pass
 
 def get_competitor_prices(url):
     prices = []
@@ -35,12 +29,32 @@ def get_competitor_prices(url):
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200: return []
         
-        # Səhifədəki gizli qiymətləri (rəqibləri) tapır
-        found = re.findall(r'(?:merchantName|name)["\']?\s*:\s*["\']([^"\']+)["\'].{1,200}?price["\']?\s*:\s*([\d\.]+)', resp.text, re.I | re.S)
-        for seller, p in found:
+        # Daha güclü qiymət axtarış şablonu (vergül və nöqtə fərqi üçün)
+        # Həm merchantName, həm də qiyməti birlikdə axtarırıq
+        raw_data = resp.text
+        
+        # NUXT və JSON formatlarını dərindən analiz edirik
+        pattern = r'(?:"merchantName"|"name")\s*:\s*["\']([^"\']+)["\'].{1,150}?"price"\s*:\s*"?([\d\.,]+)"?'
+        matches = re.findall(pattern, raw_data, re.IGNORECASE | re.DOTALL)
+        
+        for seller, p_str in matches:
             if "unistore" not in seller.lower():
-                prices.append(float(p))
-    except: pass
+                # Vergülü nöqtəyə çevirib float edirik
+                clean_p = float(p_str.replace(",", "."))
+                if clean_p > 0:
+                    prices.append(clean_p)
+        
+        # Əgər yuxarıdakı tapmasa, sadəcə qiymət bloklarını yoxla
+        if not prices:
+            simple_prices = re.findall(r'"price"\s*:\s*"?([\d\.,]+)"?', raw_data)
+            for p_str in simple_prices:
+                p_val = float(p_str.replace(",", "."))
+                if 0 < p_val < 100000 and abs(p_val - 0) > 0.1: # Boş qiymətləri at
+                    prices.append(p_val)
+
+    except Exception as e:
+        log.warning(f"Link oxuma xətası: {e}")
+    
     return list(set(prices))
 
 def process_product(p):
@@ -51,31 +65,34 @@ def process_product(p):
         
         comp_prices = get_competitor_prices(p['url'])
         
-        # Rəqib yoxdursa -> Maksimum qiymətə qaldır
-        if not comp_prices:
-            if current < max_p:
-                return {"row": p['row'], "new": max_p, "name": p['name'], "msg": f"📈 Tək satıcıyıq: {max_p}₼"}
-            return None
-
-        cheapest_competitor = min(comp_prices)
-
-        # QAYDA 1: Əgər məndəki qiymət rəqiblə eynidirsə (və ya daha ucuzdur) -> Dəyişmə
-        if current <= cheapest_competitor:
-            return None
-
-        # QAYDA 2: Rəqib məndən ucuzdursa -> 0.01 düş, amma O xanasından (Min) aşağı düşmə
-        target = max(cheapest_competitor - PRICE_UNDERCUT, min_p)
+        # Tapılan bütün qiymətlərdən öz qiymətimizi çıxarırıq ki, rəqibləri görək
+        competitors = [p for p in comp_prices if abs(p - current) > 0.1]
         
-        if abs(target - current) > 0.01:
-            return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib: {cheapest_competitor}₼ | Yeni: {round(target, 2)}₼"}
+        log.info(f"🔍 {p['name']} | Biz: {current} | Tapılan Rəqiblər: {competitors}")
+
+        if not competitors:
+            if current < max_p:
+                return {"row": p['row'], "new": max_p, "name": p['name'], "msg": f"📈 Tək satıcıyıq (və ya ən ucuzuq). Max-a qalxdı: {max_p}₼"}
+            return None
+
+        cheapest_competitor = min(competitors)
+
+        # Əgər kimsə bizdən ucuzdursa
+        if cheapest_competitor < current:
+            target = max(cheapest_competitor - PRICE_UNDERCUT, min_p)
+            if abs(target - current) > 0.01:
+                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest_competitor}₼) tapıldı. Yeni qiymət: {round(target, 2)}₼"}
+        
+        # Əgər biz ən ucuzuqsa amma rəqiblə aramızda çox fərq varsa (məs. 1100 rəqibdir, biz 1000-ik), 
+        # qiyməti rəqibə yaxınlaşdıra bilərik (məs. 1099.99). Amma sizin istəyinizlə hələlik toxunmuruq.
             
-    except: pass
+    except Exception as e:
+        log.error(f"Məhsul emal xətası: {e}")
     return None
 
 def run_check():
     log.info("🚀 Yoxlama başladı...")
     try:
-        # Google Drive-dan faylı yüklə
         file_id = EXCEL_FILE_URL.split("/d/")[1].split("/")[0]
         creds = Credentials.from_service_account_info(json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}")), 
                                                       scopes=["https://www.googleapis.com/auth/drive"])
@@ -90,11 +107,16 @@ def run_check():
             if not url or "http" not in str(url): continue
             
             try:
+                # Qiymətləri oxuyarkən xəta olmaması üçün təmizləyirik
+                curr_val = float(str(row[COL_QIYMET-1] or 0).replace(",",".").replace(" ",""))
+                min_val = float(str(row[COL_MIN-1] or 0).replace(",",".").replace(" ",""))
+                max_val = float(str(row[COL_MAX-1] or 0).replace(",",".").replace(" ",""))
+                
+                if curr_val == 0 or min_val == 0: continue
+
                 products.append({
                     "row": i, "url": str(url), "name": f"{row[3]} {row[2]}",
-                    "current": float(str(row[COL_QIYMET-1]).replace(",",".").replace(" ","")),
-                    "min": float(str(row[COL_MIN-1]).replace(",",".").replace(" ","")),
-                    "max": float(str(row[COL_MAX-1]).replace(",",".").replace(" ",""))
+                    "current": curr_val, "min": min_val, "max": max_val
                 })
             except: continue
 
@@ -106,7 +128,6 @@ def run_check():
                 if res: changes.append(res)
 
         if changes:
-            # Excel-i yenilə və geri yüklə
             wb = openpyxl.load_workbook(BytesIO(resp.content))
             ws = wb.active
             for c in changes:
@@ -122,7 +143,7 @@ def run_check():
             log.info("✅ Dəyişiklik yoxdur.")
 
     except Exception as e:
-        log.error(f"Xəta: {e}")
+        log.error(f"Sistem xətası: {e}")
 
 if __name__ == "__main__":
     run_check()
