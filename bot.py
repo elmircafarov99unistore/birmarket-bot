@@ -290,13 +290,21 @@ def process_product(p: dict) -> dict:
         log.warning(f"  ⚠️  Scraping xətası — qiymət saxlanılır")
         return {"status": "error"}
 
-    log.info(f"  🌐 Birmarket: {main_price:.2f}₼ | Satıcı: '{seller_name}'")
+    log.info(f"  🌐 Birmarket ana qiymət: {main_price:.2f}₼ | Satıcı: '{seller_name}'")
 
-    is_ours = "unistore" in seller_name
+    # Satıcı adından yoxla (əgər tapılıbsa)
+    if seller_name:
+        is_ours = "unistore" in seller_name
+    else:
+        # Satıcı adı tapılmadısa — qiymətlə müqayisə et
+        # Əgər səhifədəki qiymət bizim qiymətimizə çox yaxındırsa → biz ana satıcıyıq
+        is_ours = abs(main_price - current) < 0.05
+
+    log.info(f"  {'✅ Biz ana satıcıyıq' if is_ours else '❌ Biz ana satıcı deyilik'}")
 
     if is_ours:
         # Ən aşağı qiymət bizdədir → heç nə etmə
-        log.info(f"  ✅ Ən aşağı qiymət bizdədir — saxlanılır: {current:.2f}₼")
+        log.info(f"  ✅ Qiymət saxlanılır: {current:.2f}₼")
         return {"status": "best_price"}
     else:
         # Başqa satıcı ucuzdur → ondan 0.01 aşağı qoy
