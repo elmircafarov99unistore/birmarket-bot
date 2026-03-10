@@ -21,21 +21,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 def parse_price(text):
-    """Mətndəki qiyməti hər cür maneəni aşaraq rəqəmə çevirir"""
+    """Hər cür mətndən xalis rəqəmi çıxarır"""
     if not text: return 0.0
-    # Rəqəm, nöqtə və vergül xaric hər şeyi (boşluq, ₼, gizli simvollar) sil
     cleaned = re.sub(r'[^0-9\.,]', '', str(text))
     if not cleaned: return 0.0
-    
-    # 1.200,09 formatını 1200.09 formatına sal
     if ',' in cleaned and '.' in cleaned:
         cleaned = cleaned.replace(',', '')
     elif ',' in cleaned:
         cleaned = cleaned.replace(',', '.')
-        
     try:
         val = float(cleaned)
-        return val if val > 10 else 0.0 # 10₼-dan aşağı rəqəmləri (ID-ləri) sayma
+        return val if 10 < val < 100000 else 0.0
     except:
         return 0.0
 
@@ -44,58 +40,55 @@ def get_competitor_prices(url):
     has_block = False
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "az-AZ,az;q=0.9,en-US;q=0.8"
         }
         resp = requests.get(url, headers=headers, timeout=20)
         if resp.status_code != 200: return [], False
         
         html = resp.text
         
-        # 1. BLOK YOXLANIŞI (Hər hansı bir rəqib adı varsa blok VAR sayılır)
-        if any(x in html for x in ["item-other-seller-list", "Digər satıcılar", "Bütün satıcıların", "other-sellers"]):
+        # 1. BLOK YOXLANIŞI (Sizin dediyiniz başlıq daxil olmaqla)
+        indicators = ["bütün satıcıların", "digər satıcılar", "bütün qiymətlər", "other-seller", "other_price"]
+        if any(x in html.lower() for x in indicators):
             has_block = True
 
-        # 2. AQRESSİV JSON-LD SKANERI (E-ticarət standartı)
-        # Birmarket adətən qiymətləri bu SEO blokunun içində saxlayır
-        json_ld = re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, re.S)
-        for j_str in json_ld:
-            try:
-                data = json.loads(j_str)
-                offers = data.get("offers", {})
-                if isinstance(offers, dict):
-                    price = offers.get("price")
-                    if price: competitors.append(parse_price(price))
-                elif isinstance(offers, list):
-                    for off in offers:
-                        price = off.get("price")
-                        if price: competitors.append(parse_price(price))
-            except: pass
+        # 2. ÜMUMİ RƏQƏM SKANERI (Regex)
+        # Səhifədəki bütün "price": 123.45 formatında olan rəqəmləri yığırıq
+        raw_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', html, re.I)
+        for p_str in raw_prices:
+            p = parse_price(p_str)
+            if p > 0: competitors.append(p)
 
-        # 3. NUXT STATE DEEP SCAN (Birmarket-in əsas beyni)
-        # MerchantName-dən sonra gələn bütün "price" açarlarını tutur (Məsafə limiti olmadan)
+        # 3. HTML TAG SKANERI (BS4)
+        # "₼" işarəsi olan bütün elementləri tapırıq
+        soup = BeautifulSoup(html, "html.parser")
+        for element in soup.find_all(string=re.compile(r'₼')):
+            p = parse_price(element)
+            if p > 0: competitors.append(p)
+            
+        # data-info attributlarını skan et
+        for tag in soup.find_all(attrs={"data-info": True}):
+            if "price" in tag["data-info"]:
+                p = parse_price(tag.get_text())
+                if p > 0: competitors.append(p)
+
+        # 4. SATICI ADLARI İLƏ YOXLAMA (Biz deyiliksə, qiymətini götür)
         chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
         for chunk in chunks[1:]:
-            # İlk mağaza adını tap
             name_match = re.match(r'["\']([^"\']+)["\']', chunk)
             if name_match:
                 seller = name_match.group(1).lower()
                 if "unistore" not in seller:
-                    # Bu satıcıya aid bütün rəqəmləri axtar
-                    p_matches = re.findall(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
-                    for p_str in p_matches:
-                        p = parse_price(p_str)
-                        if p > 0:
-                            competitors.append(p)
-                            has_block = True
-
-        # 4. HTML TAG SKANERI (BS4)
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup.find_all(attrs={"data-info": re.compile(r'price|seller')}):
-            p = parse_price(tag.get_text())
-            if p > 0: competitors.append(p)
+                    has_block = True
+                    # Bu satıcıya aid ilk tapılan rəqəmi götür
+                    p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
+                    if p_match:
+                        p = parse_price(p_match.group(1))
+                        if p > 0: competitors.append(p)
 
     except Exception as e:
-        log.warning(f"Bağlantı xətası: {e}")
+        log.warning(f"Səhifə oxuma xətası: {e}")
     
     return list(set(competitors)), has_block
 
@@ -104,9 +97,9 @@ def process_product(p):
         current = p['current']
         min_p = p['min']
         
-        comp_prices, has_block = get_competitor_prices(p['url'])
-        # Öz qiymətimizlə eyni olanları (və ya çox yaxın olanları) silirik
-        competitors = [price for price in comp_prices if abs(price - current) > 0.1]
+        all_prices, has_block = get_competitor_prices(p['url'])
+        # Öz qiymətimizdən fərqli olanları rəqib sayırıq
+        competitors = [price for price in all_prices if abs(price - current) > 0.5]
         
         log.info(f"🔍 {p['name']} | Biz: {current} | Rəqiblər: {sorted(competitors)} | Blok: {'VAR' if has_block else 'YOXDUR'}")
 
@@ -114,18 +107,18 @@ def process_product(p):
             return None
 
         if not competitors:
-            log.info("  ℹ️  Rəqib qiyməti oxuna bilmədi və ya yoxdur.")
+            log.info("  ℹ️  Blok var, amma rəqib qiyməti oxuna bilmədi.")
             return None
 
         cheapest = min(competitors)
 
-        # Əgər rəqib bizdən ucuzdursa -> 0.01₼ düş, amma Min-dən aşağı düşmə
+        # Əgər ən ucuz rəqib bizdən ucuzdursa -> 0.01₼ düş
         if cheapest < current:
             target = max(cheapest - PRICE_UNDERCUT, min_p)
             if current - target > 0.009:
                 return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest}₼) tapıldı. Yeni: {round(target, 2)}₼"}
         
-        log.info("  ℹ️  Qiymət artıq ən ucuzdur.")
+        log.info("  ℹ️  Ən yaxşı qiymət artıq bizdədir.")
             
     except Exception as e:
         log.error(f"Xəta: {e}")
@@ -135,10 +128,10 @@ def run_check():
     log.info("🚀 Yoxlama başladı...")
     try:
         file_id = EXCEL_FILE_URL.split("/d/")[1].split("/")[0]
-        creds_json = json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
-        creds = Credentials.from_service_account_info(creds_json, scopes=["https://www.googleapis.com/auth/drive"])
-        
+        creds = Credentials.from_service_account_info(json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}")), 
+                                                      scopes=["https://www.googleapis.com/auth/drive"])
         resp = requests.get(f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx", timeout=30)
+        
         wb = openpyxl.load_workbook(BytesIO(resp.content), data_only=True)
         ws = wb.active
         
@@ -178,7 +171,7 @@ def run_check():
                 headers={"Authorization": f"Bearer {creds.token}"}, data=out.getvalue(), timeout=60)
             log.info(f"✅ {len(changes)} məhsul yeniləndi.")
         else:
-            log.info("✅ Dəyişiklik yoxdur.")
+            log.info("✅ Dəyişiklik ehtiyacı yoxdur.")
     except Exception as e:
         log.error(f"Sistem xətası: {e}")
 
