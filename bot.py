@@ -13,11 +13,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 PRICE_UNDERCUT = 0.01
 MAX_WORKERS = 3 
 
-# Sütunlar (Excel-ə əsasən tənzimləndi)
-COL_QIYMET = 8   # H
-COL_URL = 14     # N
-COL_MIN = 15     # O
-COL_MAX = 16     # P
+# Sütunlar (Excel-ə əsasən: H=8, N=14, O=15, P=16)
+COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15; COL_MAX = 16
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -29,28 +26,31 @@ def get_competitor_prices(url):
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200: return []
         
-        # Daha güclü qiymət axtarış şablonu (vergül və nöqtə fərqi üçün)
-        # Həm merchantName, həm də qiyməti birlikdə axtarırıq
         raw_data = resp.text
         
-        # NUXT və JSON formatlarını dərindən analiz edirik
-        pattern = r'(?:"merchantName"|"name")\s*:\s*["\']([^"\']+)["\'].{1,150}?"price"\s*:\s*"?([\d\.,]+)"?'
-        matches = re.findall(pattern, raw_data, re.IGNORECASE | re.DOTALL)
+        # 1. Bütün mümkün qiymət formatlarını tap (JS və JSON)
+        # Qiymətləri dırnaqlı, dırnaqsız, vergüllü və ya nöqtəli şəkildə axtarır
+        found_prices = re.findall(r'"price"\s*:\s*"?([\d\.,]+)"?', raw_data)
         
+        for p_str in found_prices:
+            try:
+                # Qiyməti təmizlə: sondakı nöqtələri sil və vergülü nöqtəyə çevir
+                clean_p = p_str.strip().rstrip('.')
+                clean_p = clean_p.replace(",", ".")
+                val = float(clean_p)
+                if 1 < val < 100000:
+                    prices.append(val)
+            except: continue
+
+        # 2. Satıcı adları ilə birlikdə axtarış (Daha dəqiq)
+        matches = re.findall(r'(?:"merchantName"|"name")\s*:\s*["\']([^"\']+)["\'].{1,150}?"price"\s*:\s*"?([\d\.,]+)"?', raw_data, re.I | re.S)
         for seller, p_str in matches:
             if "unistore" not in seller.lower():
-                # Vergülü nöqtəyə çevirib float edirik
-                clean_p = float(p_str.replace(",", "."))
-                if clean_p > 0:
-                    prices.append(clean_p)
-        
-        # Əgər yuxarıdakı tapmasa, sadəcə qiymət bloklarını yoxla
-        if not prices:
-            simple_prices = re.findall(r'"price"\s*:\s*"?([\d\.,]+)"?', raw_data)
-            for p_str in simple_prices:
-                p_val = float(p_str.replace(",", "."))
-                if 0 < p_val < 100000 and abs(p_val - 0) > 0.1: # Boş qiymətləri at
-                    prices.append(p_val)
+                try:
+                    clean_p = p_str.strip().rstrip('.').replace(",", ".")
+                    val = float(clean_p)
+                    prices.append(val)
+                except: continue
 
     except Exception as e:
         log.warning(f"Link oxuma xətası: {e}")
@@ -65,29 +65,27 @@ def process_product(p):
         
         comp_prices = get_competitor_prices(p['url'])
         
-        # Tapılan bütün qiymətlərdən öz qiymətimizi çıxarırıq ki, rəqibləri görək
-        competitors = [p for p in comp_prices if abs(p - current) > 0.1]
+        # Öz qiymətimizdən 0.05-dən çox fərqlənənləri rəqib sayırıq (eyni qiyməti çıxarırıq)
+        competitors = [p for p in comp_prices if abs(p - current) > 0.05]
         
-        log.info(f"🔍 {p['name']} | Biz: {current} | Tapılan Rəqiblər: {competitors}")
+        log.info(f"🔍 {p['name']} | Cari: {current} | Rəqiblər: {sorted(competitors)}")
 
         if not competitors:
-            if current < max_p:
-                return {"row": p['row'], "new": max_p, "name": p['name'], "msg": f"📈 Tək satıcıyıq (və ya ən ucuzuq). Max-a qalxdı: {max_p}₼"}
+            # Rəqib yoxdursa və ya hamısı bizimlə eyni qiymətdədirsə -> Maksimuma qaldır
+            if current < max_p - 0.05:
+                return {"row": p['row'], "new": max_p, "name": p['name'], "msg": f"📈 Max-a qalxdı: {max_p}₼"}
             return None
 
         cheapest_competitor = min(competitors)
 
-        # Əgər kimsə bizdən ucuzdursa
+        # Əgər kimsə bizdən ucuzdursa -> 0.01 düş, amma Min-dən aşağı düşmə
         if cheapest_competitor < current:
             target = max(cheapest_competitor - PRICE_UNDERCUT, min_p)
-            if abs(target - current) > 0.01:
-                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest_competitor}₼) tapıldı. Yeni qiymət: {round(target, 2)}₼"}
-        
-        # Əgər biz ən ucuzuqsa amma rəqiblə aramızda çox fərq varsa (məs. 1100 rəqibdir, biz 1000-ik), 
-        # qiyməti rəqibə yaxınlaşdıra bilərik (məs. 1099.99). Amma sizin istəyinizlə hələlik toxunmuruq.
+            if current - target > 0.01: # Əgər 1 qəpikdən çox dəyişiklik varsa
+                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest_competitor}₼) tapıldı. Yeni: {round(target, 2)}₼"}
             
     except Exception as e:
-        log.error(f"Məhsul emal xətası: {e}")
+        log.error(f"Xəta: {e}")
     return None
 
 def run_check():
@@ -107,7 +105,6 @@ def run_check():
             if not url or "http" not in str(url): continue
             
             try:
-                # Qiymətləri oxuyarkən xəta olmaması üçün təmizləyirik
                 curr_val = float(str(row[COL_QIYMET-1] or 0).replace(",",".").replace(" ",""))
                 min_val = float(str(row[COL_MIN-1] or 0).replace(",",".").replace(" ",""))
                 max_val = float(str(row[COL_MAX-1] or 0).replace(",",".").replace(" ",""))
@@ -132,7 +129,10 @@ def run_check():
             ws = wb.active
             for c in changes:
                 ws.cell(row=c['row'], column=COL_QIYMET, value=c['new'])
-                send_telegram(f"💰 <b>{c['name']}</b>\n{c['msg']}")
+                try:
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
+                                   json={"chat_id": TELEGRAM_CHAT_ID, "text": f"💰 <b>{c['name']}</b>\n{c['msg']}", "parse_mode": "HTML"}, timeout=5)
+                except: pass
             
             out = BytesIO()
             wb.save(out)
