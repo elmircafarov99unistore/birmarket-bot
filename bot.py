@@ -197,60 +197,63 @@ def get_product_id(url: str):
 
 
 def get_page_price(url: str):
-    """Birmarket API və JSON-LD ilə ən aşağı qiyməti oxuyur."""
+    """Birmarket səhifəsindən qiyməti oxuyur."""
     try:
-        product_id = get_product_id(url)
-
-        # 1. Birmarket satıcı API-si
-        if product_id:
-            api_url = f"https://birmarket.az/api/v1/products/{product_id}/sellers"
-            try:
-                r = requests.get(api_url, headers=HEADERS, timeout=10)
-                if r.status_code == 200:
-                    data = r.json()
-                    prices = []
-                    items = data if isinstance(data, list) else data.get("data", data.get("sellers", data.get("items", [])))
-                    if isinstance(items, list):
-                        for s in items:
-                            for key in ("price", "currentPrice", "current_price", "amount"):
-                                p = s.get(key)
-                                if p:
-                                    try:
-                                        prices.append(float(p))
-                                    except:
-                                        pass
-                                    break
-                    if prices:
-                        log.info(f"  📡 API: {sorted(round(x,2) for x in prices)} → min: {min(prices)}")
-                        return min(prices)
-            except Exception as e:
-                log.warning(f"  API xətası: {e}")
-
-        # 2. JSON-LD fallback
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
+            log.warning(f"  HTTP {resp.status_code}")
             return None
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string or "")
-                offers = data.get("offers", {})
-                if isinstance(offers, dict):
-                    p = float(offers.get("price", 0))
-                    if p > 1:
-                        log.info(f"  📄 JSON-LD: {p}")
-                        return p
-                elif isinstance(offers, list):
-                    prices = [float(o.get("price", 0)) for o in offers if o.get("price")]
-                    if prices:
-                        log.info(f"  📄 JSON-LD: {sorted(round(x,2) for x in prices)} → min: {min(prices)}")
-                        return min(prices)
-            except:
-                pass
+        text = resp.text
+        all_prices = []
 
-        log.warning(f"  ⚠️ Qiymət tapılmadı")
-        return None
+        # 1. Nuxt 3 __NUXT_DATA__ script-i
+        nuxt_match = re.search(r'id="__NUXT_DATA__"[^>]*>(.*?)</script>', text, re.DOTALL)
+        if nuxt_match:
+            try:
+                raw = nuxt_match.group(1)
+                for m in re.finditer(r'"price":\s*"?([\d]+\.?[\d]*)"?', raw):
+                    p = float(m.group(1))
+                    if 10 < p < 100000:
+                        all_prices.append(p)
+                if all_prices:
+                    log.info(f"  📡 Nuxt data: {sorted(set(round(x,2) for x in all_prices))[:8]}")
+            except Exception as e:
+                log.warning(f"  Nuxt parse: {e}")
+
+        # 2. JSON-LD
+        if not all_prices:
+            soup = BeautifulSoup(text, "html.parser")
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    data = json.loads(script.string or "")
+                    offers = data.get("offers", {})
+                    if isinstance(offers, dict):
+                        p = float(offers.get("price", 0))
+                        if p > 10:
+                            all_prices.append(p)
+                    elif isinstance(offers, list):
+                        for o in offers:
+                            p = float(o.get("price", 0))
+                            if p > 10:
+                                all_prices.append(p)
+                except:
+                    pass
+
+        # 3. Son cəhd - XX.XX formatında ədədlər
+        if not all_prices:
+            for m in re.finditer(r"(\d{2,6}\.\d{2})", text):
+                p = float(m.group(1))
+                if 10 < p < 100000:
+                    all_prices.append(p)
+
+        if not all_prices:
+            log.warning(f"  ⚠️ Qiymət tapılmadı")
+            return None
+
+        min_p = round(min(all_prices), 2)
+        log.info(f"  🌐 Min qiymət: {min_p}₼")
+        return min_p
 
     except Exception as e:
         log.warning(f"  Scrape xətası [{type(e).__name__}]: {e}")
