@@ -2,11 +2,18 @@
 Birmarket.az Qiymət İzləmə Botu
 ================================
 Məntiq:
-  - Birmarket səhifəsindəki ən aşağı qiymət (ana satıcı) bizdədirsə → Max-a qaldır
-  - Bizdə deyilsə → Ana qiymət - 0.01 qoy (min limitə qədər)
+  - Birmarket-dəki ana qiymət >= bizim qiymət → biz ən ucuzuq → dəyişmə
+  - Birmarket-dəki ana qiymət < bizim qiymət  → rəqib ucuzdur → ondan 0.01 aşağı qoy
+  - Nəticə min limitdən aşağı olmasın
 """
 
-import json, time, re, schedule, logging, os, requests
+import json
+import time
+import re
+import schedule
+import logging
+import os
+import requests
 from datetime import datetime
 from typing import Optional, Tuple
 from bs4 import BeautifulSoup
@@ -16,34 +23,29 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
 
-# ─────────────────────────────────────────────
-# KONFİQURASİYA
-# ─────────────────────────────────────────────
-CONFIG = {
-    "excel_file_url":         os.environ.get("EXCEL_FILE_URL", ""),
-    "sheet_name":             os.environ.get("SHEET_NAME", "Əsas"),
-    "data_start_row":         2,
-    "telegram_bot_token":     os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-    "telegram_chat_id":       os.environ.get("TELEGRAM_CHAT_ID", ""),
-    "check_interval_minutes": 10,
-    "price_undercut":         0.01,
-    "max_workers":            5,
-    "log_file":               "birmarket_bot.log",
-}
+EXCEL_FILE_URL         = os.environ.get("EXCEL_FILE_URL", "")
+TELEGRAM_BOT_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID       = os.environ.get("TELEGRAM_CHAT_ID", "")
+CHECK_INTERVAL_MINUTES = 10
+PRICE_UNDERCUT         = 0.01
+MAX_WORKERS            = 5
+DATA_START_ROW         = 2
 
-COL = {
-    "barkod": 0, "mpn": 1, "model": 2, "brend": 3,
-    "olke": 4, "say": 5, "endirimli": 6,
-    "qiymet": 7, "tesvir": 8, "start": 9,
-    "finish": 10, "taksit": 11, "aylar": 12,
-    "url": 13, "min_qiymet": 14, "max_qiymet": 15,
-}
+COL_BARKOD    = 0
+COL_MPN       = 1
+COL_MODEL     = 2
+COL_BREND     = 3
+COL_ENDIRIMLI = 6
+COL_QIYMET    = 7
+COL_URL       = 13
+COL_MIN       = 14
+COL_MAX       = 15
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(CONFIG["log_file"], encoding="utf-8"),
+        logging.FileHandler("birmarket_bot.log", encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -54,32 +56,33 @@ HEADERS = {
     "Accept-Language": "az,en;q=0.5",
 }
 
-# ─────────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────────
+
 def send_telegram(message: str):
-    token   = CONFIG.get("telegram_bot_token", "")
-    chat_id = CONFIG.get("telegram_chat_id", "")
-    if not token or not chat_id:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
             timeout=10,
         )
     except Exception as e:
         log.warning(f"Telegram xətası: {e}")
 
-# ─────────────────────────────────────────────
-# GOOGLE DRİVE
-# ─────────────────────────────────────────────
-def get_credentials(scopes):
+
+def get_drive_credentials():
     info = json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}"))
-    return Credentials.from_service_account_info(info, scopes=scopes)
+    return Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive"]
+    )
+
+
+def get_file_id() -> str:
+    return EXCEL_FILE_URL.split("/d/")[1].split("/")[0]
+
 
 def download_excel() -> bytes:
-    file_id = CONFIG["excel_file_url"].split("/d/")[1].split("/")[0]
+    file_id = get_file_id()
     resp = requests.get(
         f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx",
         timeout=30,
@@ -87,13 +90,13 @@ def download_excel() -> bytes:
     resp.raise_for_status()
     return resp.content
 
+
 def upload_excel(data: bytes) -> bool:
     try:
-        file_id = CONFIG["excel_file_url"].split("/d/")[1].split("/")[0]
-        creds = get_credentials(["https://www.googleapis.com/auth/drive"])
+        creds = get_drive_credentials()
         creds.refresh(Request())
         resp = requests.patch(
-            f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media",
+            f"https://www.googleapis.com/upload/drive/v3/files/{get_file_id()}?uploadType=media",
             headers={
                 "Authorization": f"Bearer {creds.token}",
                 "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -106,57 +109,58 @@ def upload_excel(data: bytes) -> bool:
         log.error(f"Upload xətası: {e}")
         return False
 
-# ─────────────────────────────────────────────
-# EXCEL OXUMA
-# ─────────────────────────────────────────────
+
 def to_float(val) -> float:
     try:
         return float(str(val).replace(",", ".").replace(" ", "").strip())
     except:
         return 0.0
 
+
 def load_products() -> list:
     products = []
     try:
-        data = download_excel()
-        wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
+        raw_data = download_excel()
+        wb = openpyxl.load_workbook(BytesIO(raw_data), data_only=True)
         ws = wb.active
-        log.info(f"📋 Vərəq: {ws.title}")
+        log.info(f"📋 Vərəq: '{ws.title}'")
 
-        for i, row in enumerate(ws.iter_rows(min_row=CONFIG["data_start_row"], values_only=True), CONFIG["data_start_row"]):
+        for i, row in enumerate(
+            ws.iter_rows(min_row=DATA_START_ROW, values_only=True), DATA_START_ROW
+        ):
             row = list(row)
-            while len(row) <= 15:
+            while len(row) <= COL_MAX:
                 row.append(None)
 
-            barkod = str(row[COL["barkod"]]).strip() if row[COL["barkod"]] else ""
-            mpn    = str(row[COL["mpn"]]).strip() if row[COL["mpn"]] else ""
+            barkod = str(row[COL_BARKOD]).strip() if row[COL_BARKOD] else ""
+            mpn    = str(row[COL_MPN]).strip() if row[COL_MPN] else ""
             key    = barkod or mpn
-            if not key:
+            if not key or key in ("None", ""):
                 continue
 
-            h_qiymet  = to_float(row[COL["qiymet"]])
-            g_endrim  = to_float(row[COL["endirimli"]])
-            min_p     = to_float(row[COL["min_qiymet"]])
-            max_p     = to_float(row[COL["max_qiymet"]])
-            url       = str(row[COL["url"]]).strip() if row[COL["url"]] else ""
-            brend     = str(row[COL["brend"]]).strip() if row[COL["brend"]] else ""
-            model     = str(row[COL["model"]]).strip() if row[COL["model"]] else ""
-            name      = f"{brend} {model}".strip() or key
+            h_val   = to_float(row[COL_QIYMET])
+            g_val   = to_float(row[COL_ENDIRIMLI])
+            min_p   = to_float(row[COL_MIN])
+            max_p   = to_float(row[COL_MAX])
+            url     = str(row[COL_URL]).strip() if row[COL_URL] else ""
+            brend   = str(row[COL_BREND]).strip() if row[COL_BREND] else ""
+            model   = str(row[COL_MODEL]).strip() if row[COL_MODEL] else ""
+            name    = f"{brend} {model}".strip() or key
 
-            current = h_qiymet if h_qiymet > 0 else g_endrim
+            current = h_val if h_val > 0 else g_val
             if current <= 0 or min_p <= 0:
                 continue
             if max_p <= 0:
                 max_p = round(min_p * 1.1, 2)
 
             products.append({
-                "barkod":        key,
-                "name":          name,
-                "current_price": current,
-                "min_price":     min_p,
-                "max_price":     max_p,
-                "sheet_row":     i,
-                "url":           url,
+                "key":     key,
+                "name":    name,
+                "current": current,
+                "min_p":   min_p,
+                "max_p":   max_p,
+                "row":     i,
+                "url":     url,
             })
 
         log.info(f"📦 {len(products)} məhsul oxundu.")
@@ -164,168 +168,130 @@ def load_products() -> list:
         log.error(f"Excel oxuma xətası: {e}")
     return products
 
-# ─────────────────────────────────────────────
-# EXCEL YAZMA
-# ─────────────────────────────────────────────
+
 def write_prices_batch(changes: list) -> bool:
     try:
-        data = download_excel()
-        wb = openpyxl.load_workbook(BytesIO(data))
-        ws = wb.active
+        raw = download_excel()
+        wb  = openpyxl.load_workbook(BytesIO(raw))
+        ws  = wb.active
 
         for ch in changes:
-            ws.cell(row=ch["row"], column=8, value=ch["price"])  # H sütunu
+            ws.cell(row=ch["row"], column=8, value=ch["price"])
 
         out = BytesIO()
         wb.save(out)
-        success = upload_excel(out.getvalue())
-        if success:
+        ok = upload_excel(out.getvalue())
+        if ok:
             log.info(f"✅ {len(changes)} dəyişiklik Excel-ə yazıldı.")
-        return success
+        else:
+            log.error("❌ Excel upload uğursuz!")
+        return ok
     except Exception as e:
         log.error(f"Batch yazma xətası: {e}")
         return False
 
-# ─────────────────────────────────────────────
-# SCRAPER — Ana qiymət və satıcı adı
-# ─────────────────────────────────────────────
-def get_page_info(url: str) -> Tuple[Optional[float], Optional[str]]:
-    """
-    Birmarket səhifəsindən:
-      - Ana (ən aşağı) qiyməti
-      - Ana satıcının adını
-    qaytarır. Xəta olsa (None, None).
-    """
+
+def get_page_price(url: str) -> Optional[float]:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
-            return None, None
+            log.warning(f"  HTTP {resp.status_code}")
+            return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Ana qiymət
-        price_el = soup.find("span", attrs={"data-info": "item-desc-price-new"})
-        if not price_el:
-            # JSON-LD fallback
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string or "")
-                    offers = data.get("offers", {})
-                    if isinstance(offers, dict):
-                        p = float(offers.get("price", 0))
-                        if p > 0:
-                            seller = offers.get("seller", {})
-                            seller_name = seller.get("name", "") if isinstance(seller, dict) else ""
-                            return p, seller_name.lower()
-                except:
-                    pass
-            return None, None
+        # 1. data-info="item-desc-price-new"
+        el = soup.find("span", attrs={"data-info": "item-desc-price-new"})
+        if el:
+            raw = re.sub(r"[^\d.,]", "", el.get_text(strip=True))
+            raw = raw.replace(",", ".")
+            if raw:
+                return float(raw)
 
-        price_text = re.sub(r"[^\d.,\s]", "", price_el.get_text(strip=True))
-        price_text = price_text.replace(",", ".").replace(" ", "")
-        main_price = float(price_text)
+        # 2. JSON-LD fallback
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                offers = data.get("offers", {})
+                if isinstance(offers, dict):
+                    p = float(offers.get("price", 0))
+                    if p > 0:
+                        return p
+                elif isinstance(offers, list):
+                    prices = [float(o.get("price", 0)) for o in offers if o.get("price")]
+                    if prices:
+                        return min(prices)
+            except:
+                pass
 
-        # Ana satıcı adı
-        seller_el = soup.find(attrs={"data-info": "item-seller-name"})
-        if not seller_el:
-            seller_el = soup.find(attrs={"data-info": "item-main-seller-name"})
-        if not seller_el:
-            # Geniş axtarış — "Satıcı-şirkət" bölməsi
-            seller_el = soup.find(class_=re.compile(r"seller.?name|store.?name", re.I))
-
-        seller_name = seller_el.get_text(strip=True).lower() if seller_el else ""
-
-        # Əgər satıcı adı tapılmadısa JSON-LD-dən cəhd et
-        if not seller_name:
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string or "")
-                    offers = data.get("offers", {})
-                    if isinstance(offers, dict):
-                        seller = offers.get("seller", {})
-                        if isinstance(seller, dict) and seller.get("name"):
-                            seller_name = seller["name"].lower()
-                            break
-                    elif isinstance(offers, list) and offers:
-                        seller = offers[0].get("seller", {})
-                        if isinstance(seller, dict) and seller.get("name"):
-                            seller_name = seller["name"].lower()
-                            break
-                except:
-                    pass
-
-        return main_price, seller_name
+        log.warning(f"  Qiymət tapılmadı")
+        return None
 
     except Exception as e:
         log.warning(f"  Scrape xətası [{type(e).__name__}]: {e}")
-        return None, None
+        return None
 
-# ─────────────────────────────────────────────
-# MƏHSUL İŞLƏMƏ
-# ─────────────────────────────────────────────
+
 def process_product(p: dict) -> dict:
-    barkod  = p["barkod"]
+    key     = p["key"]
     name    = p["name"]
-    current = p["current_price"]
-    min_p   = p["min_price"]
-    max_p   = p["max_price"]
-    row     = p["sheet_row"]
+    current = p["current"]
+    min_p   = p["min_p"]
+    max_p   = p["max_p"]
+    row     = p["row"]
     url     = p["url"]
 
-    log.info(f"🔍 {name} | {current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
-
-    # Min limit yoxlaması
-    if current < min_p:
-        log.info(f"  ⬆️  Min-dən aşağı — Min-ə qaldırılır: {min_p:.2f}₼")
-        return {"status": "updated", "direction": "up", "name": name,
-                "old": current, "new": min_p, "row": row, "barkod": barkod}
+    log.info(f"🔍 {name} | Cari:{current:.2f}₼ | Min:{min_p:.2f} Max:{max_p:.2f}")
 
     if not url or not url.startswith("http"):
         log.warning(f"  ⚠️  URL yoxdur — keçilir")
         return {"status": "error"}
 
-    main_price, seller_name = get_page_info(url)
+    site_price = get_page_price(url)
 
-    if main_price is None:
-        log.warning(f"  ⚠️  Scraping xətası — qiymət saxlanılır")
+    if site_price is None:
+        log.warning(f"  ⚠️  Qiymət oxunmadı — saxlanılır")
         return {"status": "error"}
 
-    log.info(f"  🌐 Birmarket ana qiymət: {main_price:.2f}₼ | Satıcı: '{seller_name}'")
+    log.info(f"  🌐 Birmarket: {site_price:.2f}₼")
 
-    # Satıcı adından yoxla (əgər tapılıbsa)
-    if seller_name:
-        is_ours = "unistore" in seller_name
-    else:
-        # Satıcı adı tapılmadısa — qiymətlə müqayisə et
-        # Biz ana satıcıyıq əgər: səhifə qiyməti bizim qiymətə bərabər və ya bizdən bahalıdır
-        is_ours = main_price >= current - 0.005
-
-
-
-    log.info(f"  {'✅ Biz ana satıcıyıq' if is_ours else '❌ Biz ana satıcı deyilik'}")
-
-    if is_ours:
-        # Ən aşağı qiymət bizdədir → heç nə etmə
-        log.info(f"  ✅ Qiymət saxlanılır: {current:.2f}₼")
+    # ƏSAS MƏNTIQ:
+    # Saytdakı qiymət >= bizim qiymət → biz ən ucuzuq → dəyişmə
+    if site_price >= current:
+        log.info(f"  ✅ Biz ən ucuzuq — dəyişmir")
         return {"status": "best_price"}
-    else:
-        # Başqa satıcı ucuzdur → ondan 0.01 aşağı qoy
-        target = round(main_price - CONFIG["price_undercut"], 2)
-        if target < min_p:
-            target = min_p
-            log.info(f"  ⚠️  Min limitə çatıldı → {min_p:.2f}₼")
-        if target > max_p:
-            target = max_p
-        if abs(target - current) < 0.01:
-            log.info(f"  ✅ Qiymət artıq düzgündür")
-            return {"status": "best_price"}
-        log.info(f"  📉 Rəqib: {main_price:.2f}₼ → Bizim: {target:.2f}₼")
-        return {"status": "updated", "direction": "down", "name": name,
-                "old": current, "new": target, "row": row, "barkod": barkod}
 
-# ─────────────────────────────────────────────
-# ƏSAS YOXLAMA
-# ─────────────────────────────────────────────
+    # Saytdakı qiymət < bizim qiymət → rəqib ucuzdur
+    target = round(site_price - PRICE_UNDERCUT, 2)
+    log.info(f"  ❌ Rəqib ucuzdur: {site_price:.2f}₼ → hədəf: {target:.2f}₼")
+
+    if target < min_p:
+        target = min_p
+        log.info(f"  ⚠️  Min limitə çatıldı → {min_p:.2f}₼")
+
+    if target > max_p:
+        target = max_p
+
+    target = round(target, 2)
+
+    # Fərq çox kiçikdirsə dəyişmə (0.005-dən az)
+    if abs(target - current) < 0.005:
+        log.info(f"  ✅ Fərq çox kiçikdir — dəyişmir")
+        return {"status": "best_price"}
+
+    direction = "up" if target > current else "down"
+    log.info(f"  💰 {current:.2f}₼ → {target:.2f}₼")
+    return {
+        "status":    "updated",
+        "direction": direction,
+        "name":      name,
+        "old":       current,
+        "new":       target,
+        "row":       row,
+        "key":       key,
+    }
+
+
 def run_check():
     log.info("=" * 55)
     log.info(f"🚀 Yoxlama — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -336,11 +302,10 @@ def run_check():
         log.error("❌ Məhsul siyahısı boşdur!")
         return
 
-    stats = {"updated_down": 0, "updated_up": 0, "best_price": 0, "error": 0}
+    stats   = {"down": 0, "up": 0, "best": 0, "error": 0}
     changes = []
-    updated_results = []
 
-    with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_product, p): p for p in products}
         for future in as_completed(futures):
             try:
@@ -348,13 +313,9 @@ def run_check():
                 status = result.get("status", "error")
                 if status == "updated":
                     changes.append({"row": result["row"], "price": result["new"]})
-                    updated_results.append(result)
-                    if result["direction"] == "down":
-                        stats["updated_down"] += 1
-                    else:
-                        stats["updated_up"] += 1
+                    stats["down" if result["direction"] == "down" else "up"] += 1
                 elif status == "best_price":
-                    stats["best_price"] += 1
+                    stats["best"] += 1
                 else:
                     stats["error"] += 1
             except Exception as e:
@@ -362,35 +323,32 @@ def run_check():
                 stats["error"] += 1
 
     if changes:
-        log.info(f"\n💾 {len(changes)} dəyişiklik Excel-ə yazılır...")
+        log.info(f"\n💾 {len(changes)} dəyişiklik yazılır...")
         write_prices_batch(changes)
 
-    total = stats["updated_down"] + stats["updated_up"]
-    log.info(f"\n✅ Tamamlandı. {total} məhsul yeniləndi.\n")
+    total = stats["down"] + stats["up"]
+    log.info(f"\n✅ Tamamlandı — {total} məhsul yeniləndi.\n")
 
     report = (
         f"📊 <b>Yoxlama Hesabatı</b>\n"
         f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📦 Ümumi məhsul: <b>{len(products)}</b>\n"
-        f"📉 Qiymət endirildi: <b>{stats['updated_down']}</b>\n"
-        f"📈 Qiymət artırıldı: <b>{stats['updated_up']}</b>\n"
-        f"✅ Düzgün qiymət: <b>{stats['best_price']}</b>\n"
-        f"❌ Xəta: <b>{stats['error']}</b>"
+        f"📉 Qiymət endirildi: <b>{stats['down']}</b>\n"
+        f"📈 Qiymət artırıldı: <b>{stats['up']}</b>\n"
+        f"✅ Düzgün qiymət: <b>{stats['best']}</b>\n"
+        f"❌ Xəta/keçildi: <b>{stats['error']}</b>"
     )
     send_telegram(report)
 
-# ─────────────────────────────────────────────
-# ƏSAS PROQRAM
-# ─────────────────────────────────────────────
+
 if __name__ == "__main__":
     log.info("🤖 Birmarket Bot işə salındı")
-    log.info(f"⏱️  Yoxlama: hər {CONFIG['check_interval_minutes']} dəq")
+    log.info(f"⏱️  Hər {CHECK_INTERVAL_MINUTES} dəqiqədə bir yoxlanır")
 
     run_check()
-    schedule.every(CONFIG["check_interval_minutes"]).minutes.do(run_check)
+    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(run_check)
 
-    log.info("🔄 Bot aktiv\n")
     while True:
         schedule.run_pending()
         time.sleep(30)
