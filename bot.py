@@ -197,66 +197,35 @@ def get_product_id(url: str):
 
 
 def get_page_price(url: str):
-    """Birmarket səhifəsindən qiyməti oxuyur."""
+    """Birmarket JSON-LD-dən ana qiyməti oxuyur."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
             log.warning(f"  HTTP {resp.status_code}")
             return None
 
-        text = resp.text
-        all_prices = []
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 1. Nuxt 3 __NUXT_DATA__ script-i
-        nuxt_match = re.search(r'id="__NUXT_DATA__"[^>]*>(.*?)</script>', text, re.DOTALL)
-        if nuxt_match:
+        for script in soup.find_all("script", type="application/ld+json"):
             try:
-                raw = nuxt_match.group(1)
-                for m in re.finditer(r'"price":\s*"?([\d]+\.?[\d]*)"?', raw):
-                    p = float(m.group(1))
-                    if 10 < p < 100000:
-                        all_prices.append(p)
-                if all_prices:
-                    log.info(f"  📡 Nuxt data: {sorted(set(round(x,2) for x in all_prices))[:8]}")
-            except Exception as e:
-                log.warning(f"  Nuxt parse: {e}")
+                data = json.loads(script.string or "")
+                offers = data.get("offers", {})
+                if isinstance(offers, dict):
+                    p = float(offers.get("price", 0))
+                    if p > 1:
+                        return p
+                elif isinstance(offers, list):
+                    prices = [float(o.get("price", 0)) for o in offers if o.get("price")]
+                    if prices:
+                        return min(prices)
+            except:
+                pass
 
-        # 2. JSON-LD
-        if not all_prices:
-            soup = BeautifulSoup(text, "html.parser")
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string or "")
-                    offers = data.get("offers", {})
-                    if isinstance(offers, dict):
-                        p = float(offers.get("price", 0))
-                        if p > 10:
-                            all_prices.append(p)
-                    elif isinstance(offers, list):
-                        for o in offers:
-                            p = float(o.get("price", 0))
-                            if p > 10:
-                                all_prices.append(p)
-                except:
-                    pass
-
-        # 3. Son cəhd - XX.XX formatında ədədlər
-        if not all_prices:
-            for m in re.finditer(r"(\d{2,6}\.\d{2})", text):
-                p = float(m.group(1))
-                if 10 < p < 100000:
-                    all_prices.append(p)
-
-        if not all_prices:
-            log.warning(f"  ⚠️ Qiymət tapılmadı")
-            return None
-
-        min_p = round(min(all_prices), 2)
-        log.info(f"  🌐 Min qiymət: {min_p}₼")
-        return min_p
+        log.warning(f"  ⚠️ Qiymət tapılmadı")
+        return None
 
     except Exception as e:
-        log.warning(f"  Scrape xətası [{type(e).__name__}]: {e}")
+        log.warning(f"  Scrape xətası: {e}")
         return None
 
 def process_product(p: dict) -> dict:
@@ -280,17 +249,21 @@ def process_product(p: dict) -> dict:
         log.warning(f"  ⚠️  Qiymət oxunmadı — saxlanılır")
         return {"status": "error"}
 
-    log.info(f"  🌐 Birmarket: {site_price:.2f}₼")
+    log.info(f"  🌐 JSON-LD qiymət: {site_price:.2f}₼")
 
-    # ƏSAS MƏNTIQ:
-    # Saytdakı qiymət >= bizim qiymət → biz ən ucuzuq → dəyişmə
-    if site_price >= current:
-        log.info(f"  ✅ Biz ən ucuzuq — dəyişmir")
+    # JSON-LD bizim qiyməti qaytarır (±0.02) → biz ana satıcıyıq → dəyişmə
+    if abs(site_price - current) <= 0.02:
+        log.info(f"  ✅ Biz ana satıcıyıq — dəyişmir")
         return {"status": "best_price"}
 
-    # Saytdakı qiymət < bizim qiymət → rəqib ucuzdur
-    target = round(site_price - PRICE_UNDERCUT, 2)
-    log.info(f"  ❌ Rəqib ucuzdur: {site_price:.2f}₼ → hədəf: {target:.2f}₼")
+    # JSON-LD bizdən ucuz qiymət qaytarır → rəqib ana satıcıdır
+    if site_price < current:
+        target = round(site_price - PRICE_UNDERCUT, 2)
+        log.info(f"  ❌ Rəqib ana satıcıdır: {site_price:.2f}₼ → hədəf: {target:.2f}₼")
+    else:
+        # JSON-LD bizdən baha → başqa məhsul ola bilər, dəyişmə
+        log.info(f"  ✅ Biz ən ucuzuq — dəyişmir")
+        return {"status": "best_price"}
 
     if target < min_p:
         target = min_p
@@ -301,7 +274,6 @@ def process_product(p: dict) -> dict:
 
     target = round(target, 2)
 
-    # Fərq çox kiçikdirsə dəyişmə (0.005-dən az)
     if abs(target - current) < 0.005:
         log.info(f"  ✅ Fərq çox kiçikdir — dəyişmir")
         return {"status": "best_price"}
