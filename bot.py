@@ -21,9 +21,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 def clean_p_text(s):
-    """Qiymət mətnini təmiz rəqəmə çevirir (boşluq, vergül və s. təmizləyir)"""
+    """Bütün növ boşluqları və formatları təmizləyib rəqəmə çevirir"""
     if not s: return 0.0
-    s = str(s).replace("₼", "").replace(" ", "").replace("\xa0", "").replace(",", ".").strip()
+    # Boşluqları, gizli simvolları və ₼ təmizləyirik
+    s = str(s).replace("₼", "").replace(" ", "").replace("\xa0", "").replace("\u00a0", "").replace(",", ".").strip()
+    # Əgər rəqəmdə birdən çox nöqtə qalıbsa (minlik ayırıcı kimi), sonuncunu saxla
+    if s.count('.') > 1:
+        parts = s.split('.')
+        s = "".join(parts[:-1]) + "." + parts[-1]
     s = s.rstrip('.')
     try:
         return float(s)
@@ -34,37 +39,45 @@ def get_competitor_prices(url):
     competitors = []
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "az-AZ,az;q=0.9,en-US;q=0.8"
         }
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=20)
         if resp.status_code != 200: return []
         
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = resp.text
         
-        # 1. YUXARIDAKI ƏSAS SATICI (Buybox)
-        main_seller_name = ""
-        main_seller_el = soup.find(attrs={"data-info": "item-main-seller-name"})
-        if main_seller_el:
-            main_seller_name = main_seller_el.get_text(strip=True).lower()
+        # 1. NUKS (JS STATE) İÇİNDƏKİ BÜTÜN SATICILARI VƏ QİYMƏTLƏRİ AXTAR (ƏN DƏQİQ ÜSUL)
+        # Bu pattern həm yuxarıdakı Buybox-u, həm də aşağıdakı siyahını tutur
+        # merchantName və price cütlüklərini axtarırıq
         
-        # Əgər əsas satıcı Unistore deyilsə, onun qiymətini rəqib siyahısına sal
-        if main_seller_name and "unistore" not in main_seller_name:
-            main_price_el = soup.find(attrs={"data-info": "item-main-price-new"}) or soup.find("div", class_="product-price")
-            if main_price_el:
-                p = clean_p_text(main_price_el.get_text())
-                if p > 0: competitors.append(p)
+        # Pattern: merchantName:"..." ... price:1200.09
+        matches = re.findall(r'merchantName["\']?\s*:\s*["\']([^"\']+)["\'].{0,500}?price["\']?\s*:\s*["\']?([\d\.,\s]+)["\']?', html, re.I | re.S)
+        for seller, p_str in matches:
+            if "unistore" not in seller.lower():
+                p = clean_p_text(p_str)
+                if p > 1: competitors.append(p)
+                
+        # Tərsinə axtarış: price:1200.09 ... merchantName:"..."
+        matches_rev = re.findall(r'price["\']?\s*:\s*["\']?([\d\.,\s]+)["\']?.{0,500}?merchantName["\']?\s*:\s*["\']([^"\']+)["\']', html, re.I | re.S)
+        for p_str, seller in matches_rev:
+            if "unistore" not in seller.lower():
+                p = clean_p_text(p_str)
+                if p > 1: competitors.append(p)
 
-        # 2. AŞAĞIDAKI "BÜTÜN QİYMƏTLƏR" (Digər satıcılar) SİYAHISI
-        other_sellers = soup.find_all(attrs={"data-info": "item-other-seller-list"})
-        for seller_box in other_sellers:
-            name_el = seller_box.find(attrs={"data-info": "item-other-seller-name"})
-            price_el = seller_box.find(attrs={"data-info": "item-desc-price-new"})
-            
-            s_name = name_el.get_text(strip=True).lower() if name_el else ""
-            if s_name and "unistore" not in s_name:
-                if price_el:
-                    p = clean_p_text(price_el.get_text())
-                    if p > 0: competitors.append(p)
+        # 2. HTML TAG-LƏRİNDƏN EHTİYAT AXTARIŞ (Skrinşotdakı "Bütün qiymətlər" bloku üçün)
+        if not competitors:
+            soup = BeautifulSoup(html, "html.parser")
+            # data-info attributu ilə satıcı və qiymət bloklarını tap
+            other_sellers = soup.find_all(attrs={"data-info": "item-other-seller-list"})
+            for box in other_sellers:
+                name_el = box.find(attrs={"data-info": "item-other-seller-name"})
+                price_el = box.find(attrs={"data-info": "item-desc-price-new"})
+                if name_el and "unistore" not in name_el.get_text().lower():
+                    if price_el:
+                        p = clean_p_text(price_el.get_text())
+                        if p > 1: competitors.append(p)
 
     except Exception as e:
         log.warning(f"Səhifə oxuma xətası: {e}")
@@ -78,24 +91,26 @@ def process_product(p):
         
         comp_prices = get_competitor_prices(p['url'])
         
-        # Öz qiymətimizlə eyni olanları rəqib saymırıq
+        # Öz qiymətimizlə eyni olanları rəqib saymırıq (0.10₼ həssaslıqla)
         competitors = [price for price in comp_prices if abs(price - current) > 0.1]
         
         log.info(f"🔍 {p['name']} | Cari: {current} | Rəqiblər: {sorted(competitors)}")
 
-        # Əgər heç bir rəqib tapılmadısa (Siyahı boşdursa) -> QİYMƏTƏ DƏYMƏ
+        # ƏGƏR RƏQİB YOXDURSA (Siyahı boşdursa) -> QİYMƏTƏ DƏYMƏ
         if not competitors:
-            log.info(f"  ℹ️  Rəqib yoxdur, qiymətə toxunulmur.")
+            log.info("  ℹ️  Rəqib yoxdur, qiymət dəyişdirilmir.")
             return None
 
-        # Əgər rəqib varsa, ən ucuzunu tapırıq
         cheapest_competitor = min(competitors)
 
-        # Əgər rəqib bizdən ucuzdursa -> 0.01 düş, amma Min-dən aşağı düşmə
+        # Əgər ən ucuz rəqib bizdən ucuzdursa -> 0.01₼ düş, amma Min-dən aşağı düşmə
         if cheapest_competitor < current:
             target = max(cheapest_competitor - PRICE_UNDERCUT, min_p)
+            # Əgər yeni qiymət indiki qiymətdən fərqlidirsə (ən azı 1 qəpik)
             if current - target > 0.009:
-                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest_competitor}₼) tapıldı. Yeni: {round(target, 2)}₼"}
+                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest_competitor}₼) ucuzdur. Yeni: {round(target, 2)}₼"}
+        
+        log.info("  ℹ️  Biz artıq ən ucuzuq, qiymət dəyişdirilmir.")
             
     except Exception as e:
         log.error(f"Xəta: {e}")
