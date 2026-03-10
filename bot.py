@@ -14,14 +14,13 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 PRICE_UNDERCUT = 0.01
 MAX_WORKERS = 3 
 
-# Sütunlar: H=8, N=14, O=15
+# Sütunlar: H=8 (Qiymət), N=14 (URL), O=15 (Min Qiymət)
 COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 def parse_price(text):
-    """Hər cür mətndən xalis rəqəmi çıxarır"""
     if not text: return 0.0
     cleaned = re.sub(r'[^0-9\.,]', '', str(text))
     if not cleaned: return 0.0
@@ -30,8 +29,7 @@ def parse_price(text):
     elif ',' in cleaned:
         cleaned = cleaned.replace(',', '.')
     try:
-        val = float(cleaned)
-        return val if 10 < val < 100000 else 0.0
+        return float(cleaned)
     except:
         return 0.0
 
@@ -40,40 +38,31 @@ def get_competitor_prices(url):
     has_block = False
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "az-AZ,az;q=0.9,en-US;q=0.8"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
         resp = requests.get(url, headers=headers, timeout=20)
         if resp.status_code != 200: return [], False
         
         html = resp.text
         
-        # 1. BLOK YOXLANIŞI (Sizin dediyiniz başlıq daxil olmaqla)
-        indicators = ["bütün satıcıların", "digər satıcılar", "bütün qiymətlər", "other-seller", "other_price"]
-        if any(x in html.lower() for x in indicators):
+        # 1. Blok yoxlanışı
+        if any(x in html.lower() for x in ["bütün satıcıların", "digər satıcılar", "bütün qiymətlər", "other-seller"]):
             has_block = True
 
-        # 2. ÜMUMİ RƏQƏM SKANERI (Regex)
-        # Səhifədəki bütün "price": 123.45 formatında olan rəqəmləri yığırıq
+        # 2. Bütün qiymətləri topla (Regex)
         raw_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', html, re.I)
         for p_str in raw_prices:
             p = parse_price(p_str)
             if p > 0: competitors.append(p)
 
-        # 3. HTML TAG SKANERI (BS4)
-        # "₼" işarəsi olan bütün elementləri tapırıq
+        # 3. HTML skan (BS4)
         soup = BeautifulSoup(html, "html.parser")
-        for element in soup.find_all(string=re.compile(r'₼')):
-            p = parse_price(element)
-            if p > 0: competitors.append(p)
-            
-        # data-info attributlarını skan et
         for tag in soup.find_all(attrs={"data-info": True}):
-            if "price" in tag["data-info"]:
+            if "price" in tag["data-info"].lower():
                 p = parse_price(tag.get_text())
                 if p > 0: competitors.append(p)
 
-        # 4. SATICI ADLARI İLƏ YOXLAMA (Biz deyiliksə, qiymətini götür)
+        # 4. Satıcı bazalı skan
         chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
         for chunk in chunks[1:]:
             name_match = re.match(r'["\']([^"\']+)["\']', chunk)
@@ -81,14 +70,13 @@ def get_competitor_prices(url):
                 seller = name_match.group(1).lower()
                 if "unistore" not in seller:
                     has_block = True
-                    # Bu satıcıya aid ilk tapılan rəqəmi götür
                     p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
                     if p_match:
                         p = parse_price(p_match.group(1))
                         if p > 0: competitors.append(p)
 
     except Exception as e:
-        log.warning(f"Səhifə oxuma xətası: {e}")
+        log.warning(f"Səhifə xətası: {e}")
     
     return list(set(competitors)), has_block
 
@@ -97,9 +85,11 @@ def process_product(p):
         current = p['current']
         min_p = p['min']
         
-        all_prices, has_block = get_competitor_prices(p['url'])
-        # Öz qiymətimizdən fərqli olanları rəqib sayırıq
-        competitors = [price for price in all_prices if abs(price - current) > 0.5]
+        all_found, has_block = get_competitor_prices(p['url'])
+        
+        # SÜZGƏC: Taksit qiymətlərini (çox aşağı rəqəmləri) təmizləyirik. 
+        # Yalnız indiki qiymətimizin ən azı 60%-i qədər olan rəqəmləri rəqib sayırıq.
+        competitors = [price for price in all_found if price > (current * 0.6)]
         
         log.info(f"🔍 {p['name']} | Biz: {current} | Rəqiblər: {sorted(competitors)} | Blok: {'VAR' if has_block else 'YOXDUR'}")
 
@@ -107,15 +97,17 @@ def process_product(p):
             return None
 
         if not competitors:
-            log.info("  ℹ️  Blok var, amma rəqib qiyməti oxuna bilmədi.")
+            log.info("  ℹ️  Real rəqib qiyməti tapılmadı.")
             return None
 
         cheapest = min(competitors)
 
-        # Əgər ən ucuz rəqib bizdən ucuzdursa -> 0.01₼ düş
-        if cheapest < current:
+        # ƏSAS DƏYİŞİKLİK: Əgər rəqib bizimlə eyni qiymətdədirsə (<=), 0.01 düşürük.
+        if cheapest <= current:
             target = max(cheapest - PRICE_UNDERCUT, min_p)
-            if current - target > 0.009:
+            
+            # Əgər hesablanan yeni qiymət indiki qiymətimizdən həqiqətən fərqlidirsə
+            if current - target >= 0.009:
                 return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest}₼) tapıldı. Yeni: {round(target, 2)}₼"}
         
         log.info("  ℹ️  Ən yaxşı qiymət artıq bizdədir.")
