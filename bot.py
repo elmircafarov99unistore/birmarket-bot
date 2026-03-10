@@ -21,16 +21,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 def parse_price(text):
+    """Mətndəki qiyməti hər cür maneəni aşaraq rəqəmə çevirir"""
     if not text: return 0.0
-    # Rəqəm, nöqtə və vergül xaric hər şeyi sil
+    # Rəqəm, nöqtə və vergül xaric hər şeyi (boşluq, ₼, gizli simvollar) sil
     cleaned = re.sub(r'[^0-9\.,]', '', str(text))
     if not cleaned: return 0.0
+    
+    # 1.200,09 formatını 1200.09 formatına sal
     if ',' in cleaned and '.' in cleaned:
         cleaned = cleaned.replace(',', '')
     elif ',' in cleaned:
         cleaned = cleaned.replace(',', '.')
-    try: return float(cleaned)
-    except: return 0.0
+        
+    try:
+        val = float(cleaned)
+        return val if val > 10 else 0.0 # 10₼-dan aşağı rəqəmləri (ID-ləri) sayma
+    except:
+        return 0.0
 
 def get_competitor_prices(url):
     competitors = []
@@ -44,40 +51,48 @@ def get_competitor_prices(url):
         
         html = resp.text
         
-        # 1. BLOKUN YOXLANIŞI
-        if any(x in html for x in ["item-other-seller-list", "Bütün satıcıların", "Digər satıcılar", "B\u00FCt\u00FCn sat\u0131c\u0131lar\u0131n"]):
+        # 1. BLOK YOXLANIŞI (Hər hansı bir rəqib adı varsa blok VAR sayılır)
+        if any(x in html for x in ["item-other-seller-list", "Digər satıcılar", "Bütün satıcıların", "other-sellers"]):
             has_block = True
 
-        # 2. DƏQİQ SATICI-QİYMƏT PARSİNQİ (Birmarket Nuxt State üçün)
-        # Səhifəni "merchantName" sözünə görə hissələrə bölürük
+        # 2. AQRESSİV JSON-LD SKANERI (E-ticarət standartı)
+        # Birmarket adətən qiymətləri bu SEO blokunun içində saxlayır
+        json_ld = re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, re.S)
+        for j_str in json_ld:
+            try:
+                data = json.loads(j_str)
+                offers = data.get("offers", {})
+                if isinstance(offers, dict):
+                    price = offers.get("price")
+                    if price: competitors.append(parse_price(price))
+                elif isinstance(offers, list):
+                    for off in offers:
+                        price = off.get("price")
+                        if price: competitors.append(parse_price(price))
+            except: pass
+
+        # 3. NUXT STATE DEEP SCAN (Birmarket-in əsas beyni)
+        # MerchantName-dən sonra gələn bütün "price" açarlarını tutur (Məsafə limiti olmadan)
         chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
-        
-        for chunk in chunks[1:]: # Birinci hissəni atırıq
-            # Satıcı adını tapırıq
+        for chunk in chunks[1:]:
+            # İlk mağaza adını tap
             name_match = re.match(r'["\']([^"\']+)["\']', chunk)
             if name_match:
-                seller_name = name_match.group(1).lower()
-                
-                # Biz deyiliksə, bu hissənin içindəki ilk qiyməti axtarırıq
-                if "unistore" not in seller_name:
-                    # Qiyməti tapan regex (məsafə limiti yoxdur)
-                    price_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
-                    if price_match:
-                        p = parse_price(price_match.group(1))
-                        if p > 10: # 10₼-dan yuxarı real qiymətlər
+                seller = name_match.group(1).lower()
+                if "unistore" not in seller:
+                    # Bu satıcıya aid bütün rəqəmləri axtar
+                    p_matches = re.findall(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
+                    for p_str in p_matches:
+                        p = parse_price(p_str)
+                        if p > 0:
                             competitors.append(p)
                             has_block = True
-                            log.info(f"   [+] Tapıldı: {seller_name.upper()} -> {p}₼")
 
-        # 3. EHTİYAT: Əgər JS-dən tapılmasa, HTML-dəki "Böyük" qiyməti götür (Buybox)
-        if not competitors:
-            soup = BeautifulSoup(html, "html.parser")
-            main_seller = soup.find(attrs={"data-info": "item-main-seller-name"})
-            if main_seller and "unistore" not in main_seller.get_text().lower():
-                p_el = soup.find(attrs={"data-info": "item-main-price-new"}) or soup.select_one(".product-price")
-                if p_el:
-                    p = parse_price(p_el.get_text())
-                    if p > 10: competitors.append(p)
+        # 4. HTML TAG SKANERI (BS4)
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(attrs={"data-info": re.compile(r'price|seller')}):
+            p = parse_price(tag.get_text())
+            if p > 0: competitors.append(p)
 
     except Exception as e:
         log.warning(f"Bağlantı xətası: {e}")
@@ -90,26 +105,28 @@ def process_product(p):
         min_p = p['min']
         
         comp_prices, has_block = get_competitor_prices(p['url'])
-        # Öz qiymətimizlə eyni olanları sil
+        # Öz qiymətimizlə eyni olanları (və ya çox yaxın olanları) silirik
         competitors = [price for price in comp_prices if abs(price - current) > 0.1]
         
-        log.info(f"🔍 {p['name']} | Cari: {current} | Rəqiblər: {sorted(competitors)} | Blok: {'VAR' if has_block else 'YOXDUR'}")
+        log.info(f"🔍 {p['name']} | Biz: {current} | Rəqiblər: {sorted(competitors)} | Blok: {'VAR' if has_block else 'YOXDUR'}")
 
-        if not has_block and not competitors:
+        if not has_block:
             return None
 
         if not competitors:
-            log.info("  ℹ️  Rəqib yoxdur, qiymət dəyişdirilmir.")
+            log.info("  ℹ️  Rəqib qiyməti oxuna bilmədi və ya yoxdur.")
             return None
 
         cheapest = min(competitors)
 
+        # Əgər rəqib bizdən ucuzdursa -> 0.01₼ düş, amma Min-dən aşağı düşmə
         if cheapest < current:
             target = max(cheapest - PRICE_UNDERCUT, min_p)
             if current - target > 0.009:
                 return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest}₼) tapıldı. Yeni: {round(target, 2)}₼"}
         
-        log.info("  ℹ️  Biz artıq ən ucuzuq.")
+        log.info("  ℹ️  Qiymət artıq ən ucuzdur.")
+            
     except Exception as e:
         log.error(f"Xəta: {e}")
     return None
