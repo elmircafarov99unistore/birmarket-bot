@@ -30,35 +30,36 @@ def get_competitor_prices(url):
         
         raw_data = resp.text
         
-        # 1. Bütün mümkün "price" dəyərlərini tapırıq
-        # "1 200.09", "1,200.09", "1200.09" kimi bütün variantları təmizləmək üçün:
-        raw_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', raw_data)
+        # 1. BÜTÜN SATICILARI VƏ QİYMƏTLƏRİ TAPA BİLƏCƏK ƏN GÜCLÜ METOD (Regex)
+        # Bu pattern həm yuxarıdakı əsas satıcını, həm də aşağıdakı siyahını tutur
         
-        # 2. Daha dəqiq: merchantName ilə birlikdə olanları tapırıq
-        nuxt_matches = re.findall(r'merchantName["\']?\s*:\s*["\']([^"\']+)["\'].*?price["\']?\s*:\s*["\']?([\d\.,\s]+)["\']?', raw_data, re.S)
-        
-        # Tapılanları təmizləmə funksiyası
-        def clean_p(s):
-            # Boşluqları, vergülləri (minlik ayırıcıdırsa) silirik, yalnız sonuncu nöqtə/vergülü saxlayırıq
-            s = s.replace(" ", "").replace("\xa0", "") # Bütün növ boşluqları sil
-            if "," in s and "." in s: # Əgər həm vergül həm nöqtə varsa (məs: 1,200.09)
-                s = s.replace(",", "")
-            elif "," in s: # Əgər yalnız vergül varsa (məs: 1200,09)
-                s = s.replace(",", ".")
-            return float(s.strip().rstrip('.'))
+        # Ümumi qiymət axtarışı (Boşluqları təmizləyərək)
+        def clean_val(s):
+            s = s.replace(" ", "").replace("\xa0", "").replace(",", ".").strip().rstrip('.')
+            return float(s)
 
-        for p_str in raw_prices:
+        # Metod A: "price": 1200.09 formatı (Əsasən yuxarıdakı qiymət üçün)
+        main_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', raw_data)
+        for p_str in main_prices:
             try:
-                val = clean_p(p_str)
+                val = clean_val(p_str)
                 if 10 < val < 100000: prices.append(val)
             except: continue
 
-        for seller, p_str in nuxt_matches:
-            if "unistore" not in seller.lower():
-                try:
-                    val = clean_p(p_str)
+        # Metod B: "merchantName" ilə bitişik qiymətlər (Aşağıdakı siyahı üçün)
+        # Bu hissədə Unistore olanları çıxarırıq
+        matches = re.findall(r'(?:"merchantName"|"name")\s*:\s*["\']([^"\']+)["\'].*?price["\']?\s*:\s*["\']?([\d\.,\s]+)["\']?', raw_data, re.S | re.I)
+        
+        for seller, p_str in matches:
+            try:
+                val = clean_val(p_str)
+                # Əgər satıcı adı Unistore deyilsə, rəqib qiyməti kimi qəbul et
+                if "unistore" not in seller.lower():
                     prices.append(val)
-                except: continue
+                else:
+                    # Əgər satıcı biziksə, bu qiyməti rəqib siyahısından sil (səhvən düşübsə)
+                    if val in prices: prices.remove(val)
+            except: continue
 
     except Exception as e:
         log.warning(f"Bağlantı xətası: {e}")
@@ -71,25 +72,25 @@ def process_product(p):
         min_p = p['min']
         max_p = p['max']
         
-        comp_prices = get_competitor_prices(p['url'])
+        all_found = get_competitor_prices(p['url'])
         
-        # Öz qiymətimizlə eyni olanları (və ya 0.10 fərqi olanları) rəqib saymırıq
-        competitors = [price for price in comp_prices if abs(price - current) > 0.1]
+        # Öz cari qiymətimizdən 0.10 fərqli olanları rəqib sayırıq
+        competitors = [price for price in all_found if abs(price - current) > 0.1]
         
-        log.info(f"🔍 {p['name']} | Cari: {current} | Rəqiblər: {sorted(competitors)}")
+        log.info(f"🔍 {p['name']} | Cari: {current} | Tapılan Bütün Rəqiblər: {sorted(competitors)}")
 
         if not competitors:
             # Rəqib yoxdursa -> Max-a qalx
             if current < max_p - 0.5:
-                return {"row": p['row'], "new": max_p, "name": p['name'], "msg": f"📈 Max-a qalxdı: {max_p}₼"}
+                return {"row": p['row'], "new": max_p, "name": p['name'], "msg": f"📈 Tək satıcıyıq. Max-a qalxdı: {max_p}₼"}
             return None
 
         cheapest_competitor = min(competitors)
 
-        # Əgər rəqib bizdən ucuzdursa -> 0.01 düş
+        # Əsas məntiq: Əgər ən ucuz rəqib bizdən ucuzdursa -> 0.01 düş
         if cheapest_competitor < current:
             target = max(cheapest_competitor - PRICE_UNDERCUT, min_p)
-            if current - target > 0.009: # 1 qəpik və daha çox fərq varsa
+            if current - target > 0.009:
                 return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest_competitor}₼) tapıldı. Yeni: {round(target, 2)}₼"}
             
     except Exception as e:
