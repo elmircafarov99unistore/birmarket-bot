@@ -192,50 +192,61 @@ def write_prices_batch(changes: list) -> bool:
 
 
 def get_page_price(url: str) -> Optional[float]:
+    """
+    Birmarket səhifəsindən ən aşağı (ana) qiyməti oxuyur.
+    Bütün satıcıların qiymətlərini taparaq minimumu qaytarır.
+    """
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
             log.warning(f"  HTTP {resp.status_code}")
             return None
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        text = resp.text
+        all_prices = []
 
-        # 1. data-info="item-desc-price-new"
-        el = soup.find("span", attrs={"data-info": "item-desc-price-new"})
-        if el:
-            raw = re.sub(r"[^\d.,]", "", el.get_text(strip=True))
-            raw = raw.replace(",", ".")
-            if raw:
-                return float(raw)
+        # 1. Bütün "price" dəyərlərini HTML-dən çək (Nuxt data içindən)
+        # Birmarket Nuxt.js işlədir, qiymətlər JS-də gizlidir
+        # Regex ilə bütün qiymət oxşar dəyərləri tap
+        price_patterns = [
+            r'"price":([\.\d]+)',
+            r'"price":"([\d]+\.?[\d]*)"',
+        ]
+        for pattern in price_patterns:
+            for m in re.finditer(pattern, text):
+                try:
+                    p = float(m.group(1))
+                    if 1 < p < 100000:  # məntiqli qiymət aralığı
+                        all_prices.append(p)
+                except:
+                    pass
 
-        # 2. JSON-LD fallback
+        # 2. JSON-LD
+        soup = BeautifulSoup(text, "html.parser")
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(script.string or "")
                 offers = data.get("offers", {})
                 if isinstance(offers, dict):
                     p = float(offers.get("price", 0))
-                    if p > 0:
-                        log.info(f"  📄 JSON-LD qiyməti: {p}")
-                        return p
+                    if p > 1:
+                        all_prices.append(p)
                 elif isinstance(offers, list):
-                    prices = [float(o.get("price", 0)) for o in offers if o.get("price")]
-                    if prices:
-                        log.info(f"  📄 JSON-LD qiymətləri: {prices} → min: {min(prices)}")
-                        return min(prices)
+                    for o in offers:
+                        p = float(o.get("price", 0))
+                        if p > 1:
+                            all_prices.append(p)
             except:
                 pass
 
-        # 3. Nuxt __NUXT__ data yoxla
-        nuxt_match = re.search(r'"price"\s*:\s*([\d.]+)', resp.text)
-        if nuxt_match:
-            p = float(nuxt_match.group(1))
-            log.info(f"  📄 Nuxt qiyməti: {p}")
-            if p > 0:
-                return p
+        if not all_prices:
+            log.warning(f"  ⚠️ Qiymət tapılmadı")
+            return None
 
-        log.warning(f"  ⚠️ Qiymət tapılmadı — HTML: {resp.text[:200]!r}")
-        return None
+        # Ən aşağı qiyməti götür
+        min_price = min(all_prices)
+        log.info(f"  📄 Tapılan qiymətlər: {sorted(set(round(x,2) for x in all_prices))[:5]} → min: {min_price}")
+        return min_price
 
     except Exception as e:
         log.warning(f"  Scrape xətası [{type(e).__name__}]: {e}")
