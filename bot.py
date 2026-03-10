@@ -5,6 +5,7 @@ import openpyxl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
+from bs4 import BeautifulSoup
 
 # KONFİQURASİYA
 EXCEL_FILE_URL = os.environ.get("EXCEL_FILE_URL", "")
@@ -13,14 +14,24 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 PRICE_UNDERCUT = 0.01
 MAX_WORKERS = 3 
 
-# Sütunlar (Excel: H=8, N=14, O=15, P=16)
+# Sütunlar: H=8, N=14, O=15, P=16
 COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15; COL_MAX = 16
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+def clean_p_text(s):
+    """Qiymət mətnini təmiz rəqəmə çevirir (boşluq, vergül və s. təmizləyir)"""
+    if not s: return 0.0
+    s = str(s).replace("₼", "").replace(" ", "").replace("\xa0", "").replace(",", ".").strip()
+    s = s.rstrip('.')
+    try:
+        return float(s)
+    except:
+        return 0.0
+
 def get_competitor_prices(url):
-    prices = []
+    competitors = []
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -28,66 +39,59 @@ def get_competitor_prices(url):
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200: return []
         
-        raw_data = resp.text
+        soup = BeautifulSoup(resp.text, "html.parser")
         
-        # 1. BÜTÜN SATICILARI VƏ QİYMƏTLƏRİ TAPA BİLƏCƏK ƏN GÜCLÜ METOD (Regex)
-        # Bu pattern həm yuxarıdakı əsas satıcını, həm də aşağıdakı siyahını tutur
+        # 1. YUXARIDAKI ƏSAS SATICI (Buybox)
+        main_seller_name = ""
+        main_seller_el = soup.find(attrs={"data-info": "item-main-seller-name"})
+        if main_seller_el:
+            main_seller_name = main_seller_el.get_text(strip=True).lower()
         
-        # Ümumi qiymət axtarışı (Boşluqları təmizləyərək)
-        def clean_val(s):
-            s = s.replace(" ", "").replace("\xa0", "").replace(",", ".").strip().rstrip('.')
-            return float(s)
+        # Əgər əsas satıcı Unistore deyilsə, onun qiymətini rəqib siyahısına sal
+        if main_seller_name and "unistore" not in main_seller_name:
+            main_price_el = soup.find(attrs={"data-info": "item-main-price-new"}) or soup.find("div", class_="product-price")
+            if main_price_el:
+                p = clean_p_text(main_price_el.get_text())
+                if p > 0: competitors.append(p)
 
-        # Metod A: "price": 1200.09 formatı (Əsasən yuxarıdakı qiymət üçün)
-        main_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', raw_data)
-        for p_str in main_prices:
-            try:
-                val = clean_val(p_str)
-                if 10 < val < 100000: prices.append(val)
-            except: continue
-
-        # Metod B: "merchantName" ilə bitişik qiymətlər (Aşağıdakı siyahı üçün)
-        # Bu hissədə Unistore olanları çıxarırıq
-        matches = re.findall(r'(?:"merchantName"|"name")\s*:\s*["\']([^"\']+)["\'].*?price["\']?\s*:\s*["\']?([\d\.,\s]+)["\']?', raw_data, re.S | re.I)
-        
-        for seller, p_str in matches:
-            try:
-                val = clean_val(p_str)
-                # Əgər satıcı adı Unistore deyilsə, rəqib qiyməti kimi qəbul et
-                if "unistore" not in seller.lower():
-                    prices.append(val)
-                else:
-                    # Əgər satıcı biziksə, bu qiyməti rəqib siyahısından sil (səhvən düşübsə)
-                    if val in prices: prices.remove(val)
-            except: continue
+        # 2. AŞAĞIDAKI "BÜTÜN QİYMƏTLƏR" (Digər satıcılar) SİYAHISI
+        other_sellers = soup.find_all(attrs={"data-info": "item-other-seller-list"})
+        for seller_box in other_sellers:
+            name_el = seller_box.find(attrs={"data-info": "item-other-seller-name"})
+            price_el = seller_box.find(attrs={"data-info": "item-desc-price-new"})
+            
+            s_name = name_el.get_text(strip=True).lower() if name_el else ""
+            if s_name and "unistore" not in s_name:
+                if price_el:
+                    p = clean_p_text(price_el.get_text())
+                    if p > 0: competitors.append(p)
 
     except Exception as e:
-        log.warning(f"Bağlantı xətası: {e}")
+        log.warning(f"Səhifə oxuma xətası: {e}")
     
-    return list(set(prices))
+    return list(set(competitors))
 
 def process_product(p):
     try:
         current = p['current']
         min_p = p['min']
-        max_p = p['max']
         
-        all_found = get_competitor_prices(p['url'])
+        comp_prices = get_competitor_prices(p['url'])
         
-        # Öz cari qiymətimizdən 0.10 fərqli olanları rəqib sayırıq
-        competitors = [price for price in all_found if abs(price - current) > 0.1]
+        # Öz qiymətimizlə eyni olanları rəqib saymırıq
+        competitors = [price for price in comp_prices if abs(price - current) > 0.1]
         
-        log.info(f"🔍 {p['name']} | Cari: {current} | Tapılan Bütün Rəqiblər: {sorted(competitors)}")
+        log.info(f"🔍 {p['name']} | Cari: {current} | Rəqiblər: {sorted(competitors)}")
 
+        # Əgər heç bir rəqib tapılmadısa (Siyahı boşdursa) -> QİYMƏTƏ DƏYMƏ
         if not competitors:
-            # Rəqib yoxdursa -> Max-a qalx
-            if current < max_p - 0.5:
-                return {"row": p['row'], "new": max_p, "name": p['name'], "msg": f"📈 Tək satıcıyıq. Max-a qalxdı: {max_p}₼"}
+            log.info(f"  ℹ️  Rəqib yoxdur, qiymətə toxunulmur.")
             return None
 
+        # Əgər rəqib varsa, ən ucuzunu tapırıq
         cheapest_competitor = min(competitors)
 
-        # Əsas məntiq: Əgər ən ucuz rəqib bizdən ucuzdursa -> 0.01 düş
+        # Əgər rəqib bizdən ucuzdursa -> 0.01 düş, amma Min-dən aşağı düşmə
         if cheapest_competitor < current:
             target = max(cheapest_competitor - PRICE_UNDERCUT, min_p)
             if current - target > 0.009:
@@ -117,9 +121,8 @@ def run_check():
                 def f_val(v): return float(str(v or 0).replace(",",".").replace(" ","").replace("\xa0",""))
                 curr = f_val(row[COL_QIYMET-1])
                 mn = f_val(row[COL_MIN-1])
-                mx = f_val(row[COL_MAX-1])
                 if curr == 0 or mn == 0: continue
-                products.append({"row": i, "url": str(url).strip(), "name": f"{row[3]} {row[2]}", "current": curr, "min": mn, "max": mx})
+                products.append({"row": i, "url": str(url).strip(), "name": f"{row[3]} {row[2]}", "current": curr, "min": mn})
             except: continue
 
         changes = []
