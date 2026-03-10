@@ -21,7 +21,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 def parse_price(text):
-    """Mətndən qiyməti təmiz rəqəm kimi çıxarır (məs: '1 200.09 ₼' -> 1200.09)"""
     if not text: return 0.0
     cleaned = re.sub(r'[^0-9\.,]', '', str(text))
     if not cleaned: return 0.0
@@ -29,10 +28,8 @@ def parse_price(text):
         cleaned = cleaned.replace(',', '')
     elif ',' in cleaned:
         cleaned = cleaned.replace(',', '.')
-    try:
-        return float(cleaned)
-    except:
-        return 0.0
+    try: return float(cleaned)
+    except: return 0.0
 
 def get_competitor_prices(url):
     competitors = []
@@ -42,46 +39,47 @@ def get_competitor_prices(url):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept-Language": "az-AZ,az;q=0.9,en-US;q=0.8"
         }
-        resp = requests.get(url, headers=headers, timeout=20)
+        session = requests.Session()
+        resp = session.get(url, headers=headers, timeout=20)
         if resp.status_code != 200: return [], False
         
         html = resp.text
-        lower_html = html.lower()
 
-        # 1. BLOKUN VARLIĞINI YOXLAYIRIQ (Bütün mümkün adlar və kodlarla)
-        # "Bütün qiymətlər", "Digər satıcılar", "item-other-seller-list" və s.
-        if any(x in lower_html for x in ["item-other-seller-list", "digər satıcılar", "bütün qiymətlər", "bütün təkliflər", "other-sellers"]):
+        # 1. NUXT DATA ANALİZİ (Birmarket-in "beyni")
+        # Bütün satıcılar və qiymətlər bu JavaScript massivinin içindədir
+        # Biz burada "merchantName" və "price" olan bütün hissələri tapırıq
+        
+        # Bu pattern həm yuxarıdakı (Buybox), həm də aşağıdakı rəqibləri 100% tutur
+        nuxt_data = re.findall(r'merchantName["\']?\s*:\s*["\']([^"\']+)["\'].{0,1000}?price["\']?\s*:\s*["\']?([\d\.,\s]+)["\']?', html, re.I | re.S)
+        
+        # Əgər Nuxt datasında özümüzdən başqa merchantName varsa, deməli rəqib bloku (siyahı) VARDIR
+        all_merchants = re.findall(r'merchantName["\']?\s*:\s*["\']([^"\']+)["\']', html, re.I)
+        unique_merchants = set([m.lower() for m in all_merchants])
+        
+        # Əgər siyahıda unistore-dan başqa mağaza varsa
+        if any(m for m in unique_merchants if "unistore" not in m):
             has_block = True
 
-        # 2. JS / NUXT DATA ANALİZİ (Məsafəni 1000 simvola qaldırdım ki, heç nə qaçmasın)
-        # Həm yuxarıdakı Buybox, həm də aşağıdakı siyahı üçün
-        pairs = re.findall(r'merchantName["\']?\s*:\s*["\']([^"\']+)["\'].{0,1000}?price["\']?\s*:\s*["\']?([\d\.,\s]+)["\']?', html, re.I | re.S)
-        for seller, p_str in pairs:
+        for seller, p_str in nuxt_data:
             if "unistore" not in seller.lower():
                 p = parse_price(p_str)
                 if p > 1:
                     competitors.append(p)
-                    has_block = True # Əgər rəqib adı və qiyməti varsa, deməli blok da var
 
-        # Qiymət əvvəl, satıcı adı sonra gələn hal üçün (Tərs axtarış)
-        pairs_rev = re.findall(r'price["\']?\s*:\s*["\']?([\d\.,\s]+)["\']?.{0,1000}?merchantName["\']?\s*:\s*["\']([^"\']+)["\']', html, re.I | re.S)
-        for p_str, seller in pairs_rev:
-            if "unistore" not in seller.lower():
-                p = parse_price(p_str)
-                if p > 1:
-                    competitors.append(p)
-                    has_block = True
-
-        # 3. HTML TAG ANALİZİ (Buybox - Ən yuxarıdakı satıcı üçün)
-        soup = BeautifulSoup(html, "html.parser")
-        main_seller_box = soup.find(attrs={"data-info": "item-main-seller-name"}) or soup.select_one(".product-seller-name")
-        if main_seller_box:
-            main_name = main_seller_box.get_text(strip=True).lower()
-            if "unistore" not in main_name:
-                price_el = soup.find(attrs={"data-info": "item-main-price-new"}) or soup.select_one(".product-price")
-                if price_el:
-                    p = parse_price(price_el.get_text())
+        # 2. ƏGƏR NUXT-DAN TAPILMASA, KLASSİK HTML YOXLAMASI
+        if not competitors:
+            soup = BeautifulSoup(html, "html.parser")
+            # Yuxarıdakı əsas satıcını yoxla
+            main_seller = soup.find(attrs={"data-info": "item-main-seller-name"})
+            if main_seller and "unistore" not in main_seller.get_text().lower():
+                p_el = soup.find(attrs={"data-info": "item-main-price-new"})
+                if p_el:
+                    p = parse_price(p_el.get_text())
                     if p > 1: competitors.append(p)
+            
+            # Aşağıdakı siyahını yoxla
+            if soup.find(attrs={"data-info": "item-other-seller-list"}) or "Digər satıcılar" in html:
+                has_block = True
 
     except Exception as e:
         log.warning(f"Səhifə oxuma xətası: {e}")
@@ -95,19 +93,19 @@ def process_product(p):
         
         comp_prices, has_block = get_competitor_prices(p['url'])
         
-        # Öz qiymətimizlə eyni olanları rəqib saymırıq
+        # Cari qiymətimizlə eyni olanları rəqib saymırıq
         competitors = [price for price in comp_prices if abs(price - current) > 0.1]
         
-        log.info(f"🔍 {p['name']} | Cari: {current} | Rəqiblər: {sorted(competitors)} | Blok var: {has_block}")
+        log.info(f"🔍 {p['name']} | Cari: {current} | Rəqiblər: {sorted(competitors)} | Blok: {'VAR' if has_block else 'YOXDUR'}")
 
-        # SİZİN QAYDANIZ: Əgər nə rəqib tapılmadısa, nə də o blok yoxdursa -> TOXUNMA
-        if not competitors and not has_block:
-            log.info("  ℹ️  Tək satıcıyıq (Blok yoxdur), qiymət sabit saxlanılır.")
+        # Sizin Qayda: Blok yoxdursa VƏ rəqib tapılmadısa -> TOXUNMA
+        if not has_block and not competitors:
+            log.info("  ℹ️  Tək satıcıyıq (Blok tapılmadı), toxunulmur.")
             return None
 
-        # Əgər rəqib tapılmadısa (bəlkə siyahıda yalnız bizik) -> TOXUNMA
+        # Blok var, amma rəqib tapılmadısa (Siyahıda tək bizik) -> TOXUNMA
         if not competitors:
-            log.info("  ℹ️  Rəqib tapılmadı, qiymət dəyişdirilmir.")
+            log.info("  ℹ️  Siyahıda başqa rəqib yoxdur, toxunulmur.")
             return None
 
         cheapest_competitor = min(competitors)
@@ -116,9 +114,9 @@ def process_product(p):
         if cheapest_competitor < current:
             target = max(cheapest_competitor - PRICE_UNDERCUT, min_p)
             if current - target > 0.009:
-                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest_competitor}₼) tapıldı. Yeni: {round(target, 2)}₼"}
+                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest_competitor}₼) ucuzdur. Yeni: {round(target, 2)}₼"}
         
-        log.info("  ℹ️  Biz artıq ən ucuzuq və ya qiymət uyğundur.")
+        log.info("  ℹ️  Qiymətimiz uyğundur.")
             
     except Exception as e:
         log.error(f"Xəta: {e}")
