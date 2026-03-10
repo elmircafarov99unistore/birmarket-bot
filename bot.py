@@ -216,15 +216,25 @@ def get_page_price(url: str) -> Optional[float]:
                 if isinstance(offers, dict):
                     p = float(offers.get("price", 0))
                     if p > 0:
+                        log.info(f"  📄 JSON-LD qiyməti: {p}")
                         return p
                 elif isinstance(offers, list):
                     prices = [float(o.get("price", 0)) for o in offers if o.get("price")]
                     if prices:
+                        log.info(f"  📄 JSON-LD qiymətləri: {prices} → min: {min(prices)}")
                         return min(prices)
             except:
                 pass
 
-        log.warning(f"  Qiymət tapılmadı")
+        # 3. Nuxt __NUXT__ data yoxla
+        nuxt_match = re.search(r'"price"\s*:\s*([\d.]+)', resp.text)
+        if nuxt_match:
+            p = float(nuxt_match.group(1))
+            log.info(f"  📄 Nuxt qiyməti: {p}")
+            if p > 0:
+                return p
+
+        log.warning(f"  ⚠️ Qiymət tapılmadı — HTML: {resp.text[:200]!r}")
         return None
 
     except Exception as e:
