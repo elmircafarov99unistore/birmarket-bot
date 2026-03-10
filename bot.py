@@ -14,7 +14,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 PRICE_UNDERCUT = 0.01
 MAX_WORKERS = 3 
 
-# Sütunlar: H=8 (Qiymət), N=14 (URL), O=15 (Min Qiymət)
+# Sütunlar: H=8, N=14, O=15
 COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -29,7 +29,8 @@ def parse_price(text):
     elif ',' in cleaned:
         cleaned = cleaned.replace(',', '.')
     try:
-        return float(cleaned)
+        # Hər zaman 2 onluq işarəyə yuvarlaqlaşdırırıq
+        return round(float(cleaned), 2)
     except:
         return 0.0
 
@@ -82,14 +83,15 @@ def get_competitor_prices(url):
 
 def process_product(p):
     try:
-        current = p['current']
-        min_p = p['min']
+        # Cari qiyməti 2 rəqəmə yuvarlaqlaşdırırıq
+        current = round(p['current'], 2)
+        min_p = round(p['min'], 2)
         
         all_found, has_block = get_competitor_prices(p['url'])
         
-        # SÜZGƏC: Taksit qiymətlərini (çox aşağı rəqəmləri) təmizləyirik. 
-        # Yalnız indiki qiymətimizin ən azı 60%-i qədər olan rəqəmləri rəqib sayırıq.
-        competitors = [price for price in all_found if price > (current * 0.6)]
+        # SÜZGƏC: Taksit qiymətlərini və Unistore-un öz qiymətini silirik
+        # Ancaq bizdən fərqli (0.01₼-dan çox fərq) olan rəqibləri saxlayırıq
+        competitors = [round(price, 2) for price in all_found if price > (current * 0.6) and abs(price - current) > 0.009]
         
         log.info(f"🔍 {p['name']} | Biz: {current} | Rəqiblər: {sorted(competitors)} | Blok: {'VAR' if has_block else 'YOXDUR'}")
 
@@ -97,20 +99,20 @@ def process_product(p):
             return None
 
         if not competitors:
-            log.info("  ℹ️  Real rəqib qiyməti tapılmadı.")
+            log.info("  ℹ️  Biz artıq ən ucuzuq və ya rəqib yoxdur.")
             return None
 
         cheapest = min(competitors)
 
-        # ƏSAS DƏYİŞİKLİK: Əgər rəqib bizimlə eyni qiymətdədirsə (<=), 0.01 düşürük.
-        if cheapest <= current:
+        # QAYDA: Ancaq rəqib bizdən qəti şəkildə UCUZDURSA düşürük
+        if cheapest < current:
             target = max(cheapest - PRICE_UNDERCUT, min_p)
             
-            # Əgər hesablanan yeni qiymət indiki qiymətimizdən həqiqətən fərqlidirsə
+            # Əgər yeni qiymət indiki ilə eyni alınırsa (məsələn min-ə toxunursa) dəyişmə
             if current - target >= 0.009:
-                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest}₼) tapıldı. Yeni: {round(target, 2)}₼"}
+                return {"row": p['row'], "new": round(target, 2), "name": p['name'], "msg": f"📉 Rəqib ({cheapest}₼) ucuzdur. Yeni: {round(target, 2)}₼"}
         
-        log.info("  ℹ️  Ən yaxşı qiymət artıq bizdədir.")
+        log.info("  ℹ️  Qiymət artıq optimaldır.")
             
     except Exception as e:
         log.error(f"Xəta: {e}")
