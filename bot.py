@@ -257,7 +257,7 @@ def get_page_info(url: str) -> Tuple[Optional[float], Optional[str]]:
         return main_price, seller_name
 
     except Exception as e:
-        log.warning(f"  Scrape xətası: {e}")
+        log.warning(f"  Scrape xətası [{type(e).__name__}]: {e}")
         return None, None
 
 # ─────────────────────────────────────────────
@@ -297,8 +297,14 @@ def process_product(p: dict) -> dict:
         is_ours = "unistore" in seller_name
     else:
         # Satıcı adı tapılmadısa — qiymətlə müqayisə et
-        # Əgər səhifədəki qiymət bizim qiymətimizə çox yaxındırsa → biz ana satıcıyıq
-        is_ours = abs(main_price - current) < 0.05
+        # Biz ana satıcıyıq əgər: səhifə qiyməti bizim qiymətə bərabər və ya bizdən bahalıdır
+        is_ours = main_price >= current - 0.005
+
+        # URL yanlışlığı yoxlaması: əgər qiymətlər çox fərqlidirsə (30%+) → bu URL bizim məhsul deyil
+        price_diff_pct = abs(main_price - current) / current * 100
+        if price_diff_pct > 30:
+            log.warning(f"  ⚠️  Qiymət fərqi {price_diff_pct:.0f}% — URL yanlış ola bilər, keçilir")
+            return {"status": "error"}
 
     log.info(f"  {'✅ Biz ana satıcıyıq' if is_ours else '❌ Biz ana satıcı deyilik'}")
 
