@@ -300,11 +300,7 @@ def process_product(p: dict) -> dict:
         # Biz ana satıcıyıq əgər: səhifə qiyməti bizim qiymətə bərabər və ya bizdən bahalıdır
         is_ours = main_price >= current - 0.005
 
-        # URL yanlışlığı yoxlaması: əgər qiymətlər çox fərqlidirsə (30%+) → bu URL bizim məhsul deyil
-        price_diff_pct = abs(main_price - current) / current * 100
-        if price_diff_pct > 30:
-            log.warning(f"  ⚠️  Qiymət fərqi {price_diff_pct:.0f}% — URL yanlış ola bilər, keçilir")
-            return {"status": "error"}
+
 
     log.info(f"  {'✅ Biz ana satıcıyıq' if is_ours else '❌ Biz ana satıcı deyilik'}")
 
