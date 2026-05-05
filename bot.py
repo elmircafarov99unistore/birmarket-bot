@@ -21,15 +21,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 def send_telegram(message):
-    """Telegram vasitəsilə bildiriş göndərir"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+    """Telegram vasitəsilə mətn bildirişi göndərir"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         log.error(f"Telegram göndərmə xətası: {e}")
+
+def send_telegram_document(file_bytes, filename, caption=""):
+    """Telegram vasitəsilə sənəd (Excel) göndərir"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+        files = {"document": (filename, file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+        requests.post(url, data=data, files=files, timeout=20)
+    except Exception as e:
+        log.error(f"Telegram sənəd göndərmə xətası: {e}")
 
 def parse_price(text):
     if not text: return 0.0
@@ -89,7 +99,6 @@ def process_product(p):
         min_p = round(p['min'], 2)
         all_found, has_block = get_competitor_prices(p['url'])
         
-        # Taksitləri və öz qiymətimizi silirik
         competitors = [round(price, 2) for price in all_found if price > (current * 0.6) and abs(price - current) > 0.009]
         
         log.info(f"🔍 {p['name']} | Biz: {current} | Rəqiblər: {sorted(competitors)}")
@@ -109,6 +118,16 @@ def process_product(p):
                     "name": p['name'], 
                     "msg": f"📉 <b>{p['name']}</b>\nRəqib: {cheapest}₼ | Yeni: <b>{round(target, 2)}₼</b>"
                 }
+            else:
+                # Qiymət endirilmədi, çünki minimum limitə dirəndik və rəqib hələ də ucuzdur
+                return {
+                    "status": "limit_reached",
+                    "name": p['name'],
+                    "url": p['url'],
+                    "current": current,
+                    "competitor": cheapest,
+                    "min": min_p
+                }
         
         return {"status": "best_price", "name": p['name']}
             
@@ -117,7 +136,8 @@ def process_product(p):
 
 def run_check():
     log.info("🚀 Yoxlama başladı...")
-    stats = {"total": 0, "updated": 0, "best": 0, "error": 0}
+    stats = {"total": 0, "updated": 0, "best": 0, "limit": 0, "error": 0}
+    limit_reached_list = [] # Limitə dirənən məhsulların siyahısı
     
     try:
         file_id = EXCEL_FILE_URL.split("/d/")[1].split("/")[0]
@@ -147,12 +167,16 @@ def run_check():
                 if res["status"] == "updated":
                     changes.append(res)
                     stats["updated"] += 1
-                    send_telegram(res["msg"]) # Hər dəyişiklik üçün dərhal mesaj
+                    send_telegram(res["msg"])
+                elif res["status"] == "limit_reached":
+                    limit_reached_list.append(res)
+                    stats["limit"] += 1
                 elif res["status"] == "best_price":
                     stats["best"] += 1
                 elif res["status"] == "error":
                     stats["error"] += 1
 
+        # Dəyişiklikləri Google Drive Excel-də yeniləyirik
         if changes:
             wb = openpyxl.load_workbook(BytesIO(resp.content))
             ws = wb.active
@@ -166,6 +190,27 @@ def run_check():
                 headers={"Authorization": f"Bearer {creds.token}"}, data=out.getvalue(), timeout=60)
             log.info(f"✅ {len(changes)} məhsul Excel-də yeniləndi.")
 
+        # LİMİTƏ ÇATANLAR ÜÇÜN EXCEL YARADILMASI VƏ GÖNDƏRİLMƏSİ
+        if limit_reached_list:
+            wb_limit = openpyxl.Workbook()
+            ws_limit = wb_limit.active
+            ws_limit.title = "Limitə Çatanlar"
+            
+            # Sütun başlıqları
+            ws_limit.append(["Məhsul Adı", "Bizim Qiymət", "Minimum Limit", "Ən Ucuz Rəqib", "Məhsul Linki"])
+            
+            # Siyahını Excel-ə doldururuq
+            for item in limit_reached_list:
+                ws_limit.append([item["name"], item["current"], item["min"], item["competitor"], item["url"]])
+                
+            out_limit = BytesIO()
+            wb_limit.save(out_limit)
+            out_limit.seek(0) # Faylı oxunması üçün başa qaytarırıq
+            
+            file_name = f"Limite_Catanlar_{datetime.now().strftime('%d_%m_%Y_%H_%M')}.xlsx"
+            caption_text = f"⚠️ <b>{len(limit_reached_list)} məhsulda minimum limitə dirəndik!</b>\nRəqiblər bizdən ucuzdur, lakin təyin etdiyiniz limitə görə qiymətlər endirilmədi. Siyahı fayldadır ⬇️"
+            send_telegram_document(out_limit.read(), file_name, caption_text)
+
         # FINAL HESABAT MESAJI
         report = (
             f"📊 <b>Yoxlama Hesabatı</b>\n"
@@ -174,6 +219,7 @@ def run_check():
             f"📦 Ümumi məhsul: <b>{stats['total']}</b>\n"
             f"📉 Qiymət endirildi: <b>{stats['updated']}</b>\n"
             f"✅ Ən ucuz bizik: <b>{stats['best']}</b>\n"
+            f"⚠️ Limitə dirənən: <b>{stats['limit']}</b>\n"
             f"❌ Xəta/Keçildi: <b>{stats['error']}</b>"
         )
         send_telegram(report)
