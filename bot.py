@@ -116,10 +116,9 @@ def process_product(p):
                     "row": p['row'], 
                     "new": round(target, 2), 
                     "name": p['name'], 
-                    "msg": f"📉 <b>{p['name']}</b>\nRəqib: {cheapest}₼ | Yeni: <b>{round(target, 2)}₼</b>"
+                    "msg": f"🔹 <b>{p['name']}</b>: {cheapest}₼ ➔ <b>{round(target, 2)}₼</b>"
                 }
             else:
-                # Qiymət endirilmədi, çünki minimum limitə dirəndik və rəqib hələ də ucuzdur
                 return {
                     "status": "limit_reached",
                     "name": p['name'],
@@ -137,7 +136,8 @@ def process_product(p):
 def run_check():
     log.info("🚀 Yoxlama başladı...")
     stats = {"total": 0, "updated": 0, "best": 0, "limit": 0, "error": 0}
-    limit_reached_list = [] # Limitə dirənən məhsulların siyahısı
+    limit_reached_list = [] 
+    updated_messages = [] # Endirilən qiymətlərin mesajlarını yığmaq üçün
     
     try:
         file_id = EXCEL_FILE_URL.split("/d/")[1].split("/")[0]
@@ -167,7 +167,7 @@ def run_check():
                 if res["status"] == "updated":
                     changes.append(res)
                     stats["updated"] += 1
-                    send_telegram(res["msg"])
+                    updated_messages.append(res["msg"]) # Mesajı siyahıya əlavə edirik
                 elif res["status"] == "limit_reached":
                     limit_reached_list.append(res)
                     stats["limit"] += 1
@@ -190,25 +190,36 @@ def run_check():
                 headers={"Authorization": f"Bearer {creds.token}"}, data=out.getvalue(), timeout=60)
             log.info(f"✅ {len(changes)} məhsul Excel-də yeniləndi.")
 
+        # ENDİRİLƏN QİYMƏTLƏRİ BİR MESAJDA GÖNDƏRİRİK
+        if updated_messages:
+            chunk = "📉 <b>Qiyməti Endirilən Məhsullar:</b>\n\n"
+            for msg in updated_messages:
+                # Telegram mesaj limiti 4096 simvoldur, ehtiyat olaraq 3800 götürürük
+                if len(chunk) + len(msg) > 3800:
+                    send_telegram(chunk)
+                    chunk = ""
+                chunk += f"{msg}\n"
+            
+            if chunk.strip():
+                send_telegram(chunk)
+
         # LİMİTƏ ÇATANLAR ÜÇÜN EXCEL YARADILMASI VƏ GÖNDƏRİLMƏSİ
         if limit_reached_list:
             wb_limit = openpyxl.Workbook()
             ws_limit = wb_limit.active
             ws_limit.title = "Limitə Çatanlar"
             
-            # Sütun başlıqları
             ws_limit.append(["Məhsul Adı", "Bizim Qiymət", "Minimum Limit", "Ən Ucuz Rəqib", "Məhsul Linki"])
             
-            # Siyahını Excel-ə doldururuq
             for item in limit_reached_list:
                 ws_limit.append([item["name"], item["current"], item["min"], item["competitor"], item["url"]])
                 
             out_limit = BytesIO()
             wb_limit.save(out_limit)
-            out_limit.seek(0) # Faylı oxunması üçün başa qaytarırıq
+            out_limit.seek(0) 
             
             file_name = f"Limite_Catanlar_{datetime.now().strftime('%d_%m_%Y_%H_%M')}.xlsx"
-            caption_text = f"⚠️ <b>{len(limit_reached_list)} məhsulda minimum limitə dirəndik!</b>\nRəqiblər bizdən ucuzdur, lakin təyin etdiyiniz limitə görə qiymətlər endirilmədi. Siyahı fayldadır ⬇️"
+            caption_text = f"⚠️ <b>{len(limit_reached_list)} məhsulda minimum limitə dirəndik!</b>\nRəqiblər bizdən ucuzdur, lakin siyahıdakı məhsullar təyin etdiyiniz limitdən aşağı düşə bilməz. (Fayl ⬇️)"
             send_telegram_document(out_limit.read(), file_name, caption_text)
 
         # FINAL HESABAT MESAJI
