@@ -96,14 +96,18 @@ def process_product(p):
         
         all_found, has_block = get_competitor_prices(p['url'])
         
-        # Filtirlənmiş rəqiblər (bizim indiki qiyməti və taksitləri çıxırıq)
-        competitors = [round(price, 2) for price in all_found if price > (current * 0.6) and abs(price - current) > 0.009]
+        # ƏSAS DÜZƏLİŞ: Əgər has_block False-dursa (yəni başqa satıcı yoxdur),
+        # tapılan bütün rəqəmlər rəqib deyil, elə bizim öz saytdakı rəqəmlərimizdir.
+        if not has_block:
+            competitors = []
+        else:
+            competitors = [round(price, 2) for price in all_found if price > (current * 0.6) and abs(price - current) > 0.009]
         
         log.info(f"🔍 {p['name']} | Biz: {current} | Min: {min_p} | Max: {max_p} | Rəqiblər: {sorted(competitors)}")
 
         # Hədəf qiyməti hesablamaq
-        if not has_block or not competitors:
-            # RƏQİB YOXDUR -> Maksimuma qaldır
+        if not competitors:
+            # RƏQİB YOXDUR (Məhsul tək bizdədir) -> Maksimuma qaldır
             target = max_p
         else:
             # RƏQİB VAR -> Ən ucuz rəqibdən 0.01₼ aşağı, amma Min-Max aralığında
@@ -132,7 +136,8 @@ def process_product(p):
                 "url": p['url'],
                 "current": current,
                 "competitor": min(competitors),
-                "min": min_p
+                "min": min_p,
+                "max": max_p # Maksimum limiti də əlavə etdik
             }
 
         return {"status": "no_change", "name": p['name']}
@@ -209,9 +214,12 @@ def run_check():
             wb_limit = openpyxl.Workbook()
             ws_limit = wb_limit.active
             ws_limit.title = "Limitə Çatanlar"
-            ws_limit.append(["Məhsul Adı", "Bizim Qiymət", "Minimum Limit", "Ən Ucuz Rəqib", "Məhsul Linki"])
+            
+            # Sütunlara 'Maksimum Limit' də əlavə olundu
+            ws_limit.append(["Məhsul Adı", "Bizim Qiymət", "Minimum Limit", "Maksimum Limit", "Ən Ucuz Rəqib", "Məhsul Linki"])
             for item in limit_reached_list:
-                ws_limit.append([item["name"], item["current"], item["min"], item["competitor"], item["url"]])
+                ws_limit.append([item["name"], item["current"], item["min"], item["max"], item["competitor"], item["url"]])
+            
             out_limit = BytesIO()
             wb_limit.save(out_limit)
             out_limit.seek(0) 
