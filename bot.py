@@ -92,12 +92,12 @@ def process_product(p):
     try:
         current = round(p['current'], 2)
         min_p = round(p['min'], 2)
-        max_p = round(min_p * 1.10, 2) # Maksimum limit (Min + 10%)
+        
+        # ⬇️ BURADA 1.10 (10%) YERİNƏ 1.05 (5%) YAZILDI ⬇️
+        max_p = round(min_p * 1.05, 2) # Maksimum limit (Min + 5%)
         
         all_found, has_block = get_competitor_prices(p['url'])
         
-        # ƏSAS DÜZƏLİŞ: Əgər has_block False-dursa (yəni başqa satıcı yoxdur),
-        # tapılan bütün rəqəmlər rəqib deyil, elə bizim öz saytdakı rəqəmlərimizdir.
         if not has_block:
             competitors = []
         else:
@@ -107,10 +107,8 @@ def process_product(p):
 
         # Hədəf qiyməti hesablamaq
         if not competitors:
-            # RƏQİB YOXDUR (Məhsul tək bizdədir) -> Maksimuma qaldır
             target = max_p
         else:
-            # RƏQİB VAR -> Ən ucuz rəqibdən 0.01₼ aşağı, amma Min-Max aralığında
             cheapest = min(competitors)
             target = max(cheapest - PRICE_UNDERCUT, min_p)
             target = min(target, max_p) # Max-ı keçməmək üçün
@@ -137,7 +135,7 @@ def process_product(p):
                 "current": current,
                 "competitor": min(competitors),
                 "min": min_p,
-                "max": max_p # Maksimum limiti də əlavə etdik
+                "max": max_p 
             }
 
         return {"status": "no_change", "name": p['name']}
@@ -215,7 +213,6 @@ def run_check():
             ws_limit = wb_limit.active
             ws_limit.title = "Limitə Çatanlar"
             
-            # Sütunlara 'Maksimum Limit' də əlavə olundu
             ws_limit.append(["Məhsul Adı", "Bizim Qiymət", "Minimum Limit", "Maksimum Limit", "Ən Ucuz Rəqib", "Məhsul Linki"])
             for item in limit_reached_list:
                 ws_limit.append([item["name"], item["current"], item["min"], item["max"], item["competitor"], item["url"]])
