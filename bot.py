@@ -5,14 +5,18 @@ import openpyxl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
-from bs4 import BeautifulSoup
 
-# KONFİQURASİYA
+# ================= KONFİQURASİYA =================
 EXCEL_FILE_URL = os.environ.get("EXCEL_FILE_URL", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ⬇️ BURA SİZİN MAĞAZANIN ADIDIR! Bot sizi bu adla tanıyacaq.
+STORE_NAME = "unistore" 
+
 PRICE_UNDERCUT = 0.01
 MAX_WORKERS = 3 
+# =================================================
 
 # Sütunlar: H=8, N=14, O=15
 COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15
@@ -20,14 +24,20 @@ COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "az,en-US;q=0.9,en;q=0.8"
+})
+
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        requests.post(url, json=payload, timeout=10)
+        session.post(url, json=payload, timeout=10)
     except Exception as e:
-        log.error(f"Telegram göndərmə xətası: {e}")
+        log.error(f"Telegram xətası: {e}")
 
 def send_telegram_document(file_bytes, filename, caption=""):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -35,83 +45,74 @@ def send_telegram_document(file_bytes, filename, caption=""):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
         data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
         files = {"document": (filename, file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
-        requests.post(url, data=data, files=files, timeout=20)
+        session.post(url, data=data, files=files, timeout=20)
     except Exception as e:
-        log.error(f"Telegram sənəd göndərmə xətası: {e}")
+        log.error(f"Telegram sənəd xətası: {e}")
 
 def parse_price(text):
     if not text: return 0.0
     cleaned = re.sub(r'[^0-9\.,]', '', str(text))
     if not cleaned: return 0.0
-    if ',' in cleaned and '.' in cleaned:
-        cleaned = cleaned.replace(',', '')
-    elif ',' in cleaned:
-        cleaned = cleaned.replace(',', '.')
-    try:
-        return round(float(cleaned), 2)
-    except:
-        return 0.0
+    if ',' in cleaned and '.' in cleaned: cleaned = cleaned.replace(',', '')
+    elif ',' in cleaned: cleaned = cleaned.replace(',', '.')
+    try: return round(float(cleaned), 2)
+    except: return 0.0
 
 def get_competitor_prices(url):
     competitors = []
     has_block = False
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
-        resp = requests.get(url, headers=headers, timeout=20)
+        resp = session.get(url, timeout=25)
         if resp.status_code != 200: return [], False
         
         html = resp.text
-        if any(x in html.lower() for x in ["bütün satıcıların", "digər satıcılar", "bütün qiymətlər", "other-seller"]):
-            has_block = True
-
-        raw_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', html, re.I)
-        for p_str in raw_prices:
-            p = parse_price(p_str)
-            if p > 0: competitors.append(p)
-
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup.find_all(attrs={"data-info": True}):
-            if "price" in tag["data-info"].lower():
-                p = parse_price(tag.get_text())
-                if p > 0: competitors.append(p)
-
+        
+        # Saytın arxa planındakı bütün "merchantName" (Satıcı adı) bloklarını tapırıq
         chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
+        
         for chunk in chunks[1:]:
             name_match = re.match(r'["\']([^"\']+)["\']', chunk)
-            if name_match and "unistore" not in name_match.group(1).lower():
-                has_block = True
-                p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
-                if p_match:
-                    p = parse_price(p_match.group(1))
-                    if p > 0: competitors.append(p)
+            if name_match:
+                merchant_name = name_match.group(1).lower()
+                
+                # ƏSAS MƏNTİQ: Satıcı "unistore" DEYİLSƏ, deməli rəqibdir!
+                if STORE_NAME not in merchant_name:
+                    has_block = True
+                    p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
+                    if p_match:
+                        p = parse_price(p_match.group(1))
+                        if p > 0: competitors.append(p)
 
-    except: pass
+    except Exception as e:
+        log.error(f"Scraping xətası: {e}")
+        
     return list(set(competitors)), has_block
 
 def process_product(p):
     try:
         current = round(p['current'], 2)
         min_p = round(p['min'], 2)
-        
-        # ⬇️ BURADA 1.10 (10%) YERİNƏ 1.05 (5%) YAZILDI ⬇️
         max_p = round(min_p * 1.05, 2) # Maksimum limit (Min + 5%)
         
+        # Bütün rəqiblər tapılır (SİZİN MAĞAZA İSTİSNA OLMAQLA)
         all_found, has_block = get_competitor_prices(p['url'])
         
         if not has_block:
             competitors = []
         else:
-            competitors = [round(price, 2) for price in all_found if price > (current * 0.6) and abs(price - current) > 0.009]
+            competitors = [round(price, 2) for price in all_found if price > (min_p * 0.7)]
         
         log.info(f"🔍 {p['name']} | Biz: {current} | Min: {min_p} | Max: {max_p} | Rəqiblər: {sorted(competitors)}")
 
         # Hədəf qiyməti hesablamaq
         if not competitors:
+            # RƏQİB YOXDUR (Tək bizik) -> Maksimuma qaldır
             target = max_p
         else:
+            # RƏQİB VAR -> Ən ucuzundan 1 qəpik aşağı
             cheapest = min(competitors)
             target = max(cheapest - PRICE_UNDERCUT, min_p)
-            target = min(target, max_p) # Max-ı keçməmək üçün
+            target = min(target, max_p) # Maksimumu keçməmək üçün
 
         # Qiymət dəyişikliyini yoxla
         if abs(current - target) >= 0.009:
@@ -126,7 +127,7 @@ def process_product(p):
                 "msg": f"{emoji} <b>{p['name']}</b>\nKöhnə: {current}₼ | Yeni: <b>{round(target, 2)}₼</b> ({status_text})"
             }
         
-        # Əgər rəqib bizdən hələ də ucuzdursa amma biz limitə çatmışıqsa
+        # Limitə çatanları tutmaq
         if competitors and min(competitors) < target:
              return {
                 "status": "limit_reached",
@@ -229,18 +230,4 @@ def run_check():
             f"📦 Ümumi: <b>{stats['total']}</b>\n"
             f"🔄 Yeniləndi: <b>{stats['updated']}</b>\n"
             f"⚠️ Limitə dirənən: <b>{stats['limit']}</b>\n"
-            f"➖ Dəyişiklik yoxdur: <b>{stats['no_change']}</b>\n"
-            f"❌ Xəta: <b>{stats['error']}</b>"
-        )
-        send_telegram(report)
-
-    except Exception as e:
-        log.error(f"Sistem xətası: {e}")
-        send_telegram(f"❌ <b>Sistem Xətası:</b>\n{str(e)}")
-
-if __name__ == "__main__":
-    run_check()
-    schedule.every(10).minutes.do(run_check)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+            f"➖ Dəyişiklik yoxdur: <b>
