@@ -9,14 +9,15 @@ from bs4 import BeautifulSoup
 
 # ================= KONFİQURASİYA =================
 EXCEL_FILE_URL = os.environ.get("EXCEL_FILE_URL", "")
+PROSPECT_EXCEL_URL = os.environ.get("PROSPECT_EXCEL_URL", "") # YENİ: Anbar faylının linki
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 PRICE_UNDERCUT = 0.01
 MAX_WORKERS = 3 
 # =================================================
 
-# Sütunlar: H=8, N=14, O=15
-COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15
+# Umico Excel Sütunları (1-dən başlayaraq): F=6 (Say), H=8 (Qiymət), N=14 (URL), O=15 (Min), Q=17 (İD)
+COL_SAY = 6; COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15; COL_ID = 17
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -107,18 +108,15 @@ def process_product(p):
                 if price > (current * 0.6) and price < (max_p * 1.5) and abs(price - current) > 0.009
             ]
         
-        log.info(f"🔍 {p['name']} | Biz: {current} | Min: {min_p} | Rəqiblər: {sorted(competitors)}")
-
         # Hədəf qiyməti hesablamaq
         if not competitors:
-            target = current # Rəqib yoxdursa qiyməti qaldırma, olduğu kimi saxla
+            target = current # Rəqib yoxdursa qaldırma
         else:
             cheapest = min(competitors)
             target = max(cheapest - PRICE_UNDERCUT, min_p)
             target = min(target, max_p)
 
-        # YENİ QAYDA: QİYMƏT QALDIRMAĞI QADAĞAN EDİRİK
-        # Əgər hesablanan hədəf qiymət indiki qiymətdən böyükdürsə, onu qaldırmırıq.
+        # QİYMƏT QALDIRMAĞI QADAĞAN EDİRİK
         if target > current:
             target = current
 
@@ -135,7 +133,7 @@ def process_product(p):
                 "msg": f"{emoji} <b>{p['name']}</b>\nKöhnə: {current}₼ | Yeni: <b>{round(target, 2)}₼</b> ({status_text})"
             }
         
-        if competitors and min(competitors) < current: # target əvəzinə current yoxlayırıq
+        if competitors and min(competitors) < current:
              return {
                 "status": "limit_reached",
                 "name": p['name'],
@@ -153,19 +151,67 @@ def process_product(p):
 
 def run_check():
     log.info("🚀 Yoxlama başladı...")
-    stats = {"total": 0, "updated": 0, "limit": 0, "error": 0, "no_change": 0}
+    stats = {"total": 0, "updated": 0, "stock_updates": 0, "limit": 0, "error": 0, "no_change": 0}
     limit_reached_list = [] 
     updated_messages = []
     
     try:
-        file_id = EXCEL_FILE_URL.split("/d/")[1].split("/")[0]
+        # Google Auth
         creds = Credentials.from_service_account_info(json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}")), 
                                                       scopes=["https://www.googleapis.com/auth/drive"])
         
+        # 1. UMİCO EXCEL FAYLINI YÜKLƏYİRİK
+        file_id = EXCEL_FILE_URL.split("/d/")[1].split("/")[0]
         resp = requests.get(f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx", timeout=30)
-        wb = openpyxl.load_workbook(BytesIO(resp.content), data_only=True)
+        wb = openpyxl.load_workbook(BytesIO(resp.content))
         ws = wb.active
         
+        # ================= STOK (SAY) SİNXRONİZASİYASI =================
+        if PROSPECT_EXCEL_URL:
+            try:
+                log.info("📦 Prospect Anbar məlumatları yoxlanılır...")
+                p_file_id = PROSPECT_EXCEL_URL.split("/d/")[1].split("/")[0]
+                p_resp = requests.get(f"https://docs.google.com/spreadsheets/d/{p_file_id}/export?format=xlsx", timeout=30)
+                p_wb = openpyxl.load_workbook(BytesIO(p_resp.content), data_only=True)
+                p_ws = p_wb.active
+                
+                # Anbar siyahısını yaradırıq {ID: SAY}
+                stock_map = {}
+                header_row_idx = 1
+                for r_idx, row in enumerate(p_ws.iter_rows(values_only=True), 1):
+                    if row and "ID nömrə" in str(row):
+                        header_row_idx = r_idx
+                        break
+                
+                for row in p_ws.iter_rows(min_row=header_row_idx+1, values_only=True):
+                    if len(row) >= 4:
+                        prod_id = str(row[2]).strip() if row[2] else None
+                        qty_val = str(row[3]).strip() if row[3] is not None else "-"
+                        
+                        if prod_id:
+                            # Tireni (-) 0 kimi qəbul edirik, qalanlarını rəqəmə çeviririk
+                            parsed_qty = 0 if qty_val == '-' else int(float(qty_val))
+                            stock_map[prod_id] = parsed_qty
+
+                # Umico faylına stokları yazırıq
+                for row_idx in range(2, ws.max_row + 1):
+                    cell_id = ws.cell(row=row_idx, column=COL_ID).value
+                    if cell_id:
+                        prod_id = str(cell_id).strip()
+                        if prod_id in stock_map:
+                            current_qty = str(ws.cell(row=row_idx, column=COL_SAY).value).strip()
+                            new_qty = stock_map[prod_id]
+                            # Əgər rəqəm dəyişibsə yenilə
+                            if current_qty != str(new_qty):
+                                ws.cell(row=row_idx, column=COL_SAY, value=new_qty)
+                                stats["stock_updates"] += 1
+                                
+                log.info(f"✅ Anbardan {stats['stock_updates']} məhsulun sayı Umico faylına yazıldı.")
+            except Exception as e:
+                log.error(f"❌ Stok sinxronizasiyası xətası: {e}")
+        # ===============================================================
+
+        # 2. QİYMƏT YOXLANMASI ÜÇÜN MƏHSULLARI SEÇİRİK
         products = []
         for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
             url = row[COL_URL-1]
@@ -178,6 +224,7 @@ def run_check():
         stats["total"] = len(products)
         changes = []
         
+        # Qiymətləri sürətlə yoxlayırıq
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [executor.submit(process_product, p) for p in products]
             for f in as_completed(futures):
@@ -194,9 +241,8 @@ def run_check():
                 elif res["status"] == "error":
                     stats["error"] += 1
 
-        if changes:
-            wb = openpyxl.load_workbook(BytesIO(resp.content))
-            ws = wb.active
+        # 3. YEKUN NƏTİCƏLƏRİ FAYLA YAZIB GOOGLE DRIVE-A YÜKLƏYİRİK
+        if changes or stats["stock_updates"] > 0:
             for c in changes:
                 ws.cell(row=c['row'], column=COL_QIYMET, value=c['new'])
             
@@ -205,8 +251,9 @@ def run_check():
             creds.refresh(Request())
             requests.patch(f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media",
                 headers={"Authorization": f"Bearer {creds.token}"}, data=out.getvalue(), timeout=60)
-            log.info(f"✅ {len(changes)} məhsul Excel-də yeniləndi.")
+            log.info(f"✅ Fayl Drive-da yeniləndi. (Qiymət: {len(changes)}, Stok: {stats['stock_updates']})")
 
+        # Telegrama Qiymət Dəyişikliyi mesajları
         if updated_messages:
             chunk = "🔄 <b>Qiymət Güncəlləmələri:</b>\n\n"
             for msg in updated_messages:
@@ -216,6 +263,7 @@ def run_check():
                 chunk += f"{msg}\n"
             if chunk.strip(): send_telegram(chunk)
 
+        # Limit Exceli
         if limit_reached_list:
             wb_limit = openpyxl.Workbook()
             ws_limit = wb_limit.active
@@ -229,14 +277,16 @@ def run_check():
             out_limit.seek(0) 
             send_telegram_document(out_limit.read(), f"Limite_Dirananlar_{datetime.now().strftime('%d_%m_%H_%M')}.xlsx", "⚠️ Rəqib bizdən ucuzdur, amma limitə görə qiymət dəyişmədi.")
 
+        # Yekun Hesabat
         report = (
             f"📊 <b>Yoxlama Hesabatı</b>\n"
             f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"📦 Ümumi: <b>{stats['total']}</b>\n"
-            f"🔄 Yeniləndi: <b>{stats['updated']}</b>\n"
+            f"📦 Ümumi məhsul: <b>{stats['total']}</b>\n"
+            f"🔢 Sayı (Stok) yeniləndi: <b>{stats['stock_updates']}</b>\n"
+            f"🔄 Qiyməti endirildi: <b>{stats['updated']}</b>\n"
             f"⚠️ Limitə dirənən: <b>{stats['limit']}</b>\n"
-            f"➖ Dəyişiklik yoxdur: <b>{stats['no_change']}</b>\n"
+            f"➖ Qiymət dəyişmədi: <b>{stats['no_change']}</b>\n"
             f"❌ Xəta: <b>{stats['error']}</b>"
         )
         send_telegram(report)
