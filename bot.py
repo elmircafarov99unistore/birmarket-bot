@@ -63,21 +63,15 @@ def get_competitor_prices(url, product_name):
         if resp.status_code != 200: return [], False
         
         html = resp.text
-        
-        # Digər satıcıların olub-olmadığını yoxlayırıq
         if any(x in html.lower() for x in ["bütün satıcıların", "digər satıcılar", "bütün qiymətlər", "other-seller"]):
             has_block = True
             
-        # BeautifulSoup ilə saytı oxumağa başlayırıq
         soup = BeautifulSoup(html, "html.parser")
-        
-        # 1. Bütün qiymət data-info atributu olan yerləri tapmaq
         for tag in soup.find_all(attrs={"data-info": True}):
             if "price" in tag["data-info"].lower():
                 p = parse_price(tag.get_text())
                 if p > 0: competitors.append(p)
                 
-        # 2. Xüsusi "Digər satıcılar" div-lərini axtarmaq (Əgər varsa)
         seller_blocks = soup.find_all('div', class_=re.compile(r'other-seller', re.I))
         for block in seller_blocks:
              has_block = True
@@ -86,18 +80,10 @@ def get_competitor_prices(url, product_name):
                  p = parse_price(tag)
                  if p > 0: competitors.append(p)
                  
-        # 3. Mətnin içində qalan qiymət kimi görünən strukturları tapmaq (arxa plan kodları)
         raw_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', html, re.I)
         for p_str in raw_prices:
             p = parse_price(p_str)
             if p > 0: competitors.append(p)
-            
-        # Əgər heç nə tapmadısa, has_block olanları True edirik
-        if len(competitors) > 0 and not has_block:
-             # Bəzən fərqli HTML strukturuna görə satıcılar bloqu fərqli yazılır. 
-             # Əgər qiymət tapıbsa deməli kimsə var (və ya özümüzük). 
-             # Lakin, yuxarıdakı "has_block" yoxlaması bunu idarə edir.
-             pass
 
     except Exception as e:
         log.error(f"Scraping xətası: {e}")
@@ -115,21 +101,26 @@ def process_product(p):
         if not has_block:
             competitors = []
         else:
-            # Sizin məşhur Taksit Qoruyucunuz (10 minlik rəqəmləri rədd edir)
+            # Taksit qoruyucusu
             competitors = [
                 round(price, 2) for price in all_found 
                 if price > (current * 0.6) and price < (max_p * 1.5) and abs(price - current) > 0.009
             ]
         
-        log.info(f"🔍 {p['name']} | Biz: {current} | Min: {min_p} | Max: {max_p} | Yekun Rəqiblər: {sorted(competitors)}")
+        log.info(f"🔍 {p['name']} | Biz: {current} | Min: {min_p} | Rəqiblər: {sorted(competitors)}")
 
         # Hədəf qiyməti hesablamaq
         if not competitors:
-            target = max_p
+            target = current # Rəqib yoxdursa qiyməti qaldırma, olduğu kimi saxla
         else:
             cheapest = min(competitors)
             target = max(cheapest - PRICE_UNDERCUT, min_p)
             target = min(target, max_p)
+
+        # YENİ QAYDA: QİYMƏT QALDIRMAĞI QADAĞAN EDİRİK
+        # Əgər hesablanan hədəf qiymət indiki qiymətdən böyükdürsə, onu qaldırmırıq.
+        if target > current:
+            target = current
 
         # Qiymət dəyişikliyini yoxla
         if abs(current - target) >= 0.009:
@@ -144,7 +135,7 @@ def process_product(p):
                 "msg": f"{emoji} <b>{p['name']}</b>\nKöhnə: {current}₼ | Yeni: <b>{round(target, 2)}₼</b> ({status_text})"
             }
         
-        if competitors and min(competitors) < target:
+        if competitors and min(competitors) < current: # target əvəzinə current yoxlayırıq
              return {
                 "status": "limit_reached",
                 "name": p['name'],
