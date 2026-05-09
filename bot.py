@@ -12,7 +12,7 @@ EXCEL_FILE_URL = os.environ.get("EXCEL_FILE_URL", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ⬇️ BURA SİZİN MAĞAZANIN ADIDIR! Bot sizi bu adla axtaracaq.
+# Mağazanın adı
 STORE_NAME = "unistore" 
 
 PRICE_UNDERCUT = 0.01
@@ -73,30 +73,33 @@ def get_competitor_prices(url, product_name):
             
         store_clean = STORE_NAME.lower().replace(" ", "").replace("-", "")
         
-        # Saytın arxa planındakı bütün "merchantName" (Satıcı adı) bloklarını tapırıq
         chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
         
         for chunk in chunks[1:]:
-            name_match = re.match(r'["\']([^"\']+)["\']', chunk)
+            chunk_clean = chunk.strip()
+            
+            # Adı tapmağa çalışırıq
+            name_match = re.search(r'^["\']([^"\']+)["\']', chunk_clean)
+            
             if name_match:
                 raw_merchant_name = name_match.group(1)
-                merchant_name = raw_merchant_name.lower().replace(" ", "").replace("-", "")
+            else:
+                # Əgər regex adı tam oxuya bilməsə, HTML-in o hissəsini birbaşa götürək ki, görək orda nə yazılıb
+                raw_merchant_name = chunk_clean[:25] 
                 
-                # Qiyməti tapırıq
-                parsed_p = 0.0
-                p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
-                if p_match:
-                    parsed_p = parse_price(p_match.group(1))
-                
-                # -------------------------------------------------------------
-                # XÜSUSİ LOG HİSSƏSİ: Saytdakı bütün adları və qiymətləri oxuyur
-                # -------------------------------------------------------------
-                log.info(f"🕵️ [{product_name}] - Saytdakı Satıcı: '{raw_merchant_name}' | Qiymət: {parsed_p}")
-                
-                # Əgər Satıcı "unistore" DEYİLSƏ, deməli rəqibdir!
-                if store_clean not in merchant_name:
-                    has_block = True
-                    if parsed_p > 0: competitors.append(parsed_p)
+            # Qiyməti tapırıq
+            parsed_p = 0.0
+            p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
+            if p_match:
+                parsed_p = parse_price(p_match.group(1))
+            
+            # 🔴 BURADA MÜTLƏQ EMOJİ ÇIXACAQ
+            log.info(f"🕵️ DİAQNOSTİKA [{product_name}]: Satıcı = '{raw_merchant_name}' | Qiymət = {parsed_p}")
+            
+            merchant_name_lower = raw_merchant_name.lower().replace(" ", "").replace("-", "")
+            if "unistore" not in merchant_name_lower:
+                has_block = True
+                if parsed_p > 0: competitors.append(parsed_p)
                     
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup.find_all(attrs={"data-info": True}):
@@ -113,9 +116,8 @@ def process_product(p):
     try:
         current = round(p['current'], 2)
         min_p = round(p['min'], 2)
-        max_p = round(min_p * 1.05, 2) # Maksimum limit (Min + 5%)
+        max_p = round(min_p * 1.05, 2) 
         
-        # Bütün rəqiblər tapılır
         all_found, has_block = get_competitor_prices(p['url'], p['name'])
         
         if not has_block:
@@ -149,7 +151,6 @@ def process_product(p):
                 "msg": f"{emoji} <b>{p['name']}</b>\nKöhnə: {current}₼ | Yeni: <b>{round(target, 2)}₼</b> ({status_text})"
             }
         
-        # Limitə çatanları tutmaq
         if competitors and min(competitors) < target:
              return {
                 "status": "limit_reached",
