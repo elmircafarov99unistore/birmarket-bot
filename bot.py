@@ -12,7 +12,6 @@ EXCEL_FILE_URL = os.environ.get("EXCEL_FILE_URL", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ⬇️ SİZİN MAĞAZANIN ADI.
 STORE_NAME = "unistore" 
 
 PRICE_UNDERCUT = 0.01
@@ -61,40 +60,38 @@ def parse_price(text):
 
 def get_competitor_prices(url):
     competitors = []
-    has_block = False
     try:
         resp = session.get(url, timeout=25)
-        if resp.status_code != 200: return [], False
+        if resp.status_code != 200: return []
         
         html = resp.text
-        
-        # 1-Cİ QORUMA: Səhifədə vizual olaraq "Digər satıcılar" varmı? Yoxdursa boşuna axtarma!
-        if not re.search(r'(bütün satıcıların|digər satıcılar|digər təkliflər|other-seller|other sellers)', html, re.I):
-            return [], False
-            
-        has_block = True
-        
-        # 2-Cİ QORUMA: Boşluqları silirik ki, "Uni Store" ilə "unistore" eyni sayılsın
         store_clean = STORE_NAME.lower().replace(" ", "").replace("-", "")
         
+        # 1. Metod: Birbaşa arxa plan kodlarından oxumaq
         chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
         for chunk in chunks[1:]:
             name_match = re.match(r'["\']([^"\']+)["\']', chunk)
             if name_match:
-                # Saytdakı satıcının adından da boşluqları silib yoxlayırıq
                 merchant_name = name_match.group(1).lower().replace(" ", "").replace("-", "")
                 
-                # Əgər bu ad bizim mağaza DEYİLSƏ, deməli rəqibdir
+                # Bizim mağaza deyil, fərqli satıcıdırsa qiyməti tap
                 if store_clean not in merchant_name:
                     p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
                     if p_match:
                         p = parse_price(p_match.group(1))
                         if p > 0: competitors.append(p)
+                        
+        # 2. Metod: HTML Tag-lərindən axtarmaq (Bəzən yuxarıdakı metoddan qaçanlar olur)
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(attrs={"data-info": True}):
+            if "price" in tag["data-info"].lower():
+                p = parse_price(tag.get_text())
+                if p > 0: competitors.append(p)
 
     except Exception as e:
         log.error(f"Scraping xətası: {e}")
         
-    return list(set(competitors)), has_block
+    return list(set(competitors))
 
 def process_product(p):
     try:
@@ -102,26 +99,24 @@ def process_product(p):
         min_p = round(p['min'], 2)
         max_p = round(min_p * 1.05, 2) # Maksimum limit (Min + 5%)
         
-        all_found, has_block = get_competitor_prices(p['url'])
+        all_found = get_competitor_prices(p['url'])
         
-        if not has_block:
-            competitors = []
-        else:
-            # 3-CÜ QORUMA: Taksit (kredit) və çox ucuz yalançı rəqəmləri filtrləyirik. 
-            # Yalnız həqiqətə uyğun (Min limitin 70%-i ilə Max limitin 150%-i arası) qiymətləri rəqib say!
-            competitors = [
-                round(price, 2) for price in all_found 
-                if (min_p * 0.7) < price < (max_p * 1.5)
-            ]
+        # SUPER FİLTR: Tapılan qiymətlərin həqiqətən rəqib olduğunu necə bilək?
+        # A) Qiymət mənim öz qiymətim DEYİL
+        # B) Qiymət mənim Minimumumun 70%-indən ÇOXDUR (Aksesuarlar atılır)
+        # C) Qiymət mənim Maksimumumun 150%-indən AZDIR (Taksit/Kreditlər atılır)
+        
+        competitors = [
+            round(price, 2) for price in all_found 
+            if (min_p * 0.7) < price < (max_p * 1.5) and abs(price - current) > 0.009
+        ]
         
         log.info(f"🔍 {p['name']} | Biz: {current} | Min: {min_p} | Max: {max_p} | Rəqiblər: {sorted(competitors)}")
 
         # Hədəf qiyməti hesablamaq
         if not competitors:
-            # RƏQİB YOXDUR (və ya filtrləndi) -> Maksimuma qaldır
             target = max_p
         else:
-            # RƏQİB VAR -> Ən ucuzundan 0.01 aşağı (Min və Max daxilində qalmaqla)
             cheapest = min(competitors)
             target = max(cheapest - PRICE_UNDERCUT, min_p)
             target = min(target, max_p)
