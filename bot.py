@@ -7,12 +7,17 @@ from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
 from bs4 import BeautifulSoup
 
-# KONFİQURASİYA
+# ================= KONFİQURASİYA =================
 EXCEL_FILE_URL = os.environ.get("EXCEL_FILE_URL", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ⬇️ BURA SİZİN MAĞAZANIN ADIDIR! Bot sizi bu adla axtaracaq.
+STORE_NAME = "unistore" 
+
 PRICE_UNDERCUT = 0.01
 MAX_WORKERS = 3 
+# =================================================
 
 # Sütunlar: H=8, N=14, O=15
 COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15
@@ -20,14 +25,20 @@ COL_QIYMET = 8; COL_URL = 14; COL_MIN = 15
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "az,en-US;q=0.9,en;q=0.8"
+})
+
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        requests.post(url, json=payload, timeout=10)
+        session.post(url, json=payload, timeout=10)
     except Exception as e:
-        log.error(f"Telegram göndərmə xətası: {e}")
+        log.error(f"Telegram xətası: {e}")
 
 def send_telegram_document(file_bytes, filename, caption=""):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -35,77 +46,76 @@ def send_telegram_document(file_bytes, filename, caption=""):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
         data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
         files = {"document": (filename, file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
-        requests.post(url, data=data, files=files, timeout=20)
+        session.post(url, data=data, files=files, timeout=20)
     except Exception as e:
-        log.error(f"Telegram sənəd göndərmə xətası: {e}")
+        log.error(f"Telegram sənəd xətası: {e}")
 
 def parse_price(text):
     if not text: return 0.0
     cleaned = re.sub(r'[^0-9\.,]', '', str(text))
     if not cleaned: return 0.0
-    if ',' in cleaned and '.' in cleaned:
-        cleaned = cleaned.replace(',', '')
-    elif ',' in cleaned:
-        cleaned = cleaned.replace(',', '.')
-    try:
-        return round(float(cleaned), 2)
-    except:
-        return 0.0
+    if ',' in cleaned and '.' in cleaned: cleaned = cleaned.replace(',', '')
+    elif ',' in cleaned: cleaned = cleaned.replace(',', '.')
+    try: return round(float(cleaned), 2)
+    except: return 0.0
 
 def get_competitor_prices(url, product_name):
     competitors = []
     has_block = False
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
-        resp = requests.get(url, headers=headers, timeout=20)
+        resp = session.get(url, timeout=25)
         if resp.status_code != 200: return [], False
         
         html = resp.text
+        
         if any(x in html.lower() for x in ["bütün satıcıların", "digər satıcılar", "bütün qiymətlər", "other-seller"]):
             has_block = True
-
-        raw_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', html, re.I)
-        for p_str in raw_prices:
-            p = parse_price(p_str)
-            if p > 0: competitors.append(p)
-
+            
+        store_clean = STORE_NAME.lower().replace(" ", "").replace("-", "")
+        
+        # Saytın arxa planındakı bütün "merchantName" (Satıcı adı) bloklarını tapırıq
+        chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
+        
+        for chunk in chunks[1:]:
+            name_match = re.match(r'["\']([^"\']+)["\']', chunk)
+            if name_match:
+                raw_merchant_name = name_match.group(1)
+                merchant_name = raw_merchant_name.lower().replace(" ", "").replace("-", "")
+                
+                # Qiyməti tapırıq
+                parsed_p = 0.0
+                p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
+                if p_match:
+                    parsed_p = parse_price(p_match.group(1))
+                
+                # -------------------------------------------------------------
+                # XÜSUSİ LOG HİSSƏSİ: Saytdakı bütün adları və qiymətləri oxuyur
+                # -------------------------------------------------------------
+                log.info(f"🕵️ [{product_name}] - Saytdakı Satıcı: '{raw_merchant_name}' | Qiymət: {parsed_p}")
+                
+                # Əgər Satıcı "unistore" DEYİLSƏ, deməli rəqibdir!
+                if store_clean not in merchant_name:
+                    has_block = True
+                    if parsed_p > 0: competitors.append(parsed_p)
+                    
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup.find_all(attrs={"data-info": True}):
             if "price" in tag["data-info"].lower():
                 p = parse_price(tag.get_text())
                 if p > 0: competitors.append(p)
 
-        # -------------------------------------------------------------
-        # DİAQNOSTİKA HİSSƏSİ: Satıcı adlarını tam olaraq necə oxuyur?
-        # -------------------------------------------------------------
-        chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
-        for chunk in chunks[1:]:
-            name_match = re.match(r'["\']([^"\']+)["\']', chunk)
-            if name_match:
-                raw_merchant_name = name_match.group(1) 
-                
-                parsed_p = 0.0
-                p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
-                if p_match:
-                    parsed_p = parse_price(p_match.group(1))
-                
-                # LOG-a ÇAP EDİRİK:
-                log.info(f"🕵️ [{product_name}] üçün tapıldı -> SATICI ADI: '{raw_merchant_name}' | QİYMƏT: {parsed_p}")
-                
-                merchant_name_lower = raw_merchant_name.lower().replace(" ", "").replace("-", "")
-                if "unistore" not in merchant_name_lower:
-                    has_block = True
-                    if parsed_p > 0: competitors.append(parsed_p)
-
-    except: pass
+    except Exception as e:
+        log.error(f"Scraping xətası: {e}")
+        
     return list(set(competitors)), has_block
 
 def process_product(p):
     try:
         current = round(p['current'], 2)
         min_p = round(p['min'], 2)
-        max_p = round(min_p * 1.05, 2)
+        max_p = round(min_p * 1.05, 2) # Maksimum limit (Min + 5%)
         
+        # Bütün rəqiblər tapılır
         all_found, has_block = get_competitor_prices(p['url'], p['name'])
         
         if not has_block:
@@ -124,7 +134,7 @@ def process_product(p):
         else:
             cheapest = min(competitors)
             target = max(cheapest - PRICE_UNDERCUT, min_p)
-            target = min(target, max_p) 
+            target = min(target, max_p)
 
         # Qiymət dəyişikliyini yoxla
         if abs(current - target) >= 0.009:
@@ -139,6 +149,7 @@ def process_product(p):
                 "msg": f"{emoji} <b>{p['name']}</b>\nKöhnə: {current}₼ | Yeni: <b>{round(target, 2)}₼</b> ({status_text})"
             }
         
+        # Limitə çatanları tutmaq
         if competitors and min(competitors) < target:
              return {
                 "status": "limit_reached",
@@ -224,7 +235,6 @@ def run_check():
             wb_limit = openpyxl.Workbook()
             ws_limit = wb_limit.active
             ws_limit.title = "Limitə Çatanlar"
-            
             ws_limit.append(["Məhsul Adı", "Bizim Qiymət", "Minimum Limit", "Maksimum Limit", "Ən Ucuz Rəqib", "Məhsul Linki"])
             for item in limit_reached_list:
                 ws_limit.append([item["name"], item["current"], item["min"], item["max"], item["competitor"], item["url"]])
