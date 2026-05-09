@@ -11,10 +11,6 @@ from bs4 import BeautifulSoup
 EXCEL_FILE_URL = os.environ.get("EXCEL_FILE_URL", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-# Mağazanın adı
-STORE_NAME = "unistore" 
-
 PRICE_UNDERCUT = 0.01
 MAX_WORKERS = 3 
 # =================================================
@@ -68,44 +64,40 @@ def get_competitor_prices(url, product_name):
         
         html = resp.text
         
+        # Digər satıcıların olub-olmadığını yoxlayırıq
         if any(x in html.lower() for x in ["bütün satıcıların", "digər satıcılar", "bütün qiymətlər", "other-seller"]):
             has_block = True
             
-        store_clean = STORE_NAME.lower().replace(" ", "").replace("-", "")
-        
-        chunks = re.split(r'merchantName["\']?\s*:\s*', html, flags=re.I)
-        
-        for chunk in chunks[1:]:
-            chunk_clean = chunk.strip()
-            
-            # Adı tapmağa çalışırıq
-            name_match = re.search(r'^["\']([^"\']+)["\']', chunk_clean)
-            
-            if name_match:
-                raw_merchant_name = name_match.group(1)
-            else:
-                # Əgər regex adı tam oxuya bilməsə, HTML-in o hissəsini birbaşa götürək ki, görək orda nə yazılıb
-                raw_merchant_name = chunk_clean[:25] 
-                
-            # Qiyməti tapırıq
-            parsed_p = 0.0
-            p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
-            if p_match:
-                parsed_p = parse_price(p_match.group(1))
-            
-            # 🔴 BURADA MÜTLƏQ EMOJİ ÇIXACAQ
-            log.info(f"🕵️ DİAQNOSTİKA [{product_name}]: Satıcı = '{raw_merchant_name}' | Qiymət = {parsed_p}")
-            
-            merchant_name_lower = raw_merchant_name.lower().replace(" ", "").replace("-", "")
-            if "unistore" not in merchant_name_lower:
-                has_block = True
-                if parsed_p > 0: competitors.append(parsed_p)
-                    
+        # BeautifulSoup ilə saytı oxumağa başlayırıq
         soup = BeautifulSoup(html, "html.parser")
+        
+        # 1. Bütün qiymət data-info atributu olan yerləri tapmaq
         for tag in soup.find_all(attrs={"data-info": True}):
             if "price" in tag["data-info"].lower():
                 p = parse_price(tag.get_text())
                 if p > 0: competitors.append(p)
+                
+        # 2. Xüsusi "Digər satıcılar" div-lərini axtarmaq (Əgər varsa)
+        seller_blocks = soup.find_all('div', class_=re.compile(r'other-seller', re.I))
+        for block in seller_blocks:
+             has_block = True
+             price_tags = block.find_all(string=re.compile(r'[\d\.,\s]+(₼|AZN)', re.I))
+             for tag in price_tags:
+                 p = parse_price(tag)
+                 if p > 0: competitors.append(p)
+                 
+        # 3. Mətnin içində qalan qiymət kimi görünən strukturları tapmaq (arxa plan kodları)
+        raw_prices = re.findall(r'["\']?price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', html, re.I)
+        for p_str in raw_prices:
+            p = parse_price(p_str)
+            if p > 0: competitors.append(p)
+            
+        # Əgər heç nə tapmadısa, has_block olanları True edirik
+        if len(competitors) > 0 and not has_block:
+             # Bəzən fərqli HTML strukturuna görə satıcılar bloqu fərqli yazılır. 
+             # Əgər qiymət tapıbsa deməli kimsə var (və ya özümüzük). 
+             # Lakin, yuxarıdakı "has_block" yoxlaması bunu idarə edir.
+             pass
 
     except Exception as e:
         log.error(f"Scraping xətası: {e}")
@@ -123,6 +115,7 @@ def process_product(p):
         if not has_block:
             competitors = []
         else:
+            # Sizin məşhur Taksit Qoruyucunuz (10 minlik rəqəmləri rədd edir)
             competitors = [
                 round(price, 2) for price in all_found 
                 if price > (current * 0.6) and price < (max_p * 1.5) and abs(price - current) > 0.009
