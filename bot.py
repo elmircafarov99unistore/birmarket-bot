@@ -82,18 +82,16 @@ def get_competitor_prices(url, product_name):
         for chunk in chunks[1:]:
             name_match = re.match(r'["\']([^"\']+)["\']', chunk)
             if name_match:
-                raw_merchant_name = name_match.group(1) # Saytda yazılan EYNİ ad
+                raw_merchant_name = name_match.group(1) 
                 
-                # Bu satıcının qiymətini tapırıq
                 parsed_p = 0.0
                 p_match = re.search(r'price["\']?\s*[:=]\s*["\']?([\d\.,\s]+)["\']?', chunk, re.I)
                 if p_match:
                     parsed_p = parse_price(p_match.group(1))
                 
-                # 🔴 LOG-a ÇAP EDİRİK:
+                # LOG-a ÇAP EDİRİK:
                 log.info(f"🕵️ [{product_name}] üçün tapıldı -> SATICI ADI: '{raw_merchant_name}' | QİYMƏT: {parsed_p}")
                 
-                # Sizin adınız "unistore" deyilsə rəqib say
                 merchant_name_lower = raw_merchant_name.lower().replace(" ", "").replace("-", "")
                 if "unistore" not in merchant_name_lower:
                     has_block = True
@@ -106,8 +104,6 @@ def process_product(p):
     try:
         current = round(p['current'], 2)
         min_p = round(p['min'], 2)
-        
-        # Maksimum limit: 5% (1.05)
         max_p = round(min_p * 1.05, 2)
         
         all_found, has_block = get_competitor_prices(p['url'], p['name'])
@@ -115,7 +111,6 @@ def process_product(p):
         if not has_block:
             competitors = []
         else:
-            # Köhnə sisteminiz, lakin taksit rəqəmlərindən (10-15 min) qorunmaq üçün max_p * 1.5 filtri qaldı
             competitors = [
                 round(price, 2) for price in all_found 
                 if price > (current * 0.6) and price < (max_p * 1.5) and abs(price - current) > 0.009
@@ -158,4 +153,106 @@ def process_product(p):
         return {"status": "no_change", "name": p['name']}
             
     except Exception as e:
-        return {"status
+        return {"status": "error", "name": p['name'], "error": str(e)}
+
+def run_check():
+    log.info("🚀 Yoxlama başladı...")
+    stats = {"total": 0, "updated": 0, "limit": 0, "error": 0, "no_change": 0}
+    limit_reached_list = [] 
+    updated_messages = []
+    
+    try:
+        file_id = EXCEL_FILE_URL.split("/d/")[1].split("/")[0]
+        creds = Credentials.from_service_account_info(json.loads(os.environ.get("GOOGLE_CREDENTIALS", "{}")), 
+                                                      scopes=["https://www.googleapis.com/auth/drive"])
+        
+        resp = requests.get(f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx", timeout=30)
+        wb = openpyxl.load_workbook(BytesIO(resp.content), data_only=True)
+        ws = wb.active
+        
+        products = []
+        for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
+            url = row[COL_URL-1]
+            if not url or "http" not in str(url): continue
+            try:
+                def f_val(v): return float(str(v or 0).replace(",",".").replace(" ","").replace("\xa0",""))
+                products.append({"row": i, "url": str(url).strip(), "name": f"{row[3]} {row[2]}", "current": f_val(row[COL_QIYMET-1]), "min": f_val(row[COL_MIN-1])})
+            except: continue
+
+        stats["total"] = len(products)
+        changes = []
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(process_product, p) for p in products]
+            for f in as_completed(futures):
+                res = f.result()
+                if res["status"] == "updated":
+                    changes.append(res)
+                    stats["updated"] += 1
+                    updated_messages.append(res["msg"])
+                elif res["status"] == "limit_reached":
+                    limit_reached_list.append(res)
+                    stats["limit"] += 1
+                elif res["status"] == "no_change":
+                    stats["no_change"] += 1
+                elif res["status"] == "error":
+                    stats["error"] += 1
+
+        if changes:
+            wb = openpyxl.load_workbook(BytesIO(resp.content))
+            ws = wb.active
+            for c in changes:
+                ws.cell(row=c['row'], column=COL_QIYMET, value=c['new'])
+            
+            out = BytesIO()
+            wb.save(out)
+            creds.refresh(Request())
+            requests.patch(f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media",
+                headers={"Authorization": f"Bearer {creds.token}"}, data=out.getvalue(), timeout=60)
+            log.info(f"✅ {len(changes)} məhsul Excel-də yeniləndi.")
+
+        if updated_messages:
+            chunk = "🔄 <b>Qiymət Güncəlləmələri:</b>\n\n"
+            for msg in updated_messages:
+                if len(chunk) + len(msg) > 3800:
+                    send_telegram(chunk)
+                    chunk = ""
+                chunk += f"{msg}\n"
+            if chunk.strip(): send_telegram(chunk)
+
+        if limit_reached_list:
+            wb_limit = openpyxl.Workbook()
+            ws_limit = wb_limit.active
+            ws_limit.title = "Limitə Çatanlar"
+            
+            ws_limit.append(["Məhsul Adı", "Bizim Qiymət", "Minimum Limit", "Maksimum Limit", "Ən Ucuz Rəqib", "Məhsul Linki"])
+            for item in limit_reached_list:
+                ws_limit.append([item["name"], item["current"], item["min"], item["max"], item["competitor"], item["url"]])
+            
+            out_limit = BytesIO()
+            wb_limit.save(out_limit)
+            out_limit.seek(0) 
+            send_telegram_document(out_limit.read(), f"Limite_Dirananlar_{datetime.now().strftime('%d_%m_%H_%M')}.xlsx", "⚠️ Rəqib bizdən ucuzdur, amma limitə görə qiymət dəyişmədi.")
+
+        report = (
+            f"📊 <b>Yoxlama Hesabatı</b>\n"
+            f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📦 Ümumi: <b>{stats['total']}</b>\n"
+            f"🔄 Yeniləndi: <b>{stats['updated']}</b>\n"
+            f"⚠️ Limitə dirənən: <b>{stats['limit']}</b>\n"
+            f"➖ Dəyişiklik yoxdur: <b>{stats['no_change']}</b>\n"
+            f"❌ Xəta: <b>{stats['error']}</b>"
+        )
+        send_telegram(report)
+
+    except Exception as e:
+        log.error(f"Sistem xətası: {e}")
+        send_telegram(f"❌ <b>Sistem Xətası:</b>\n{str(e)}")
+
+if __name__ == "__main__":
+    run_check()
+    schedule.every(10).minutes.do(run_check)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
